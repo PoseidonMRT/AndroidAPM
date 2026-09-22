@@ -374,6 +374,8 @@ apmSlowMethod {
 }
 ```
 
+`plugins{}` 中 `com.apm.slow-method` 可先可后于 Android 插件声明：插桩通过 `withPlugin` 延迟到 Android 插件就位后注册，顺序不再影响生效。`excludePackages` 采用包边界语义——不带尾点的 `com.example` 只排除其包及子包，不会误排 `com.exampleevil.*`；带尾点写法维持原前缀语义。
+
 ## 重要默认值
 
 | 配置 | 默认值 | 含义 |

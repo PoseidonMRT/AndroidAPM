@@ -35,7 +35,7 @@ Native target 具备 16 KiB page-size linker alignment。
 
 `app_exit` 使用系统记录的退出时间和历史进程名，线程名为 `unknown`，不携带采集时的业务上下文。严格 V3 使用退出前写入 `ActivityManager.setProcessStateSummary` 的完整 occurrence 五字段：serviceVersion、versionCode、appBuild、variant、匿名 installationId；不把当前 release 或 Native frames 填入历史记录。摘要使用带版本标记的严格 UTF-8 编码，总长度最多 128 字节。任一字段无法完整容纳、摘要缺失/损坏/属于其他组件时，历史身份为未知；V3 在入队前拒绝该记录并计入 `HISTORICAL_OCCURRENCE_UNAVAILABLE`，且推进处理水位，避免每次启动反复丢弃同一记录。不会自动降级 V2。显式 V2/旧协议保留 `occurrenceStatus=UNKNOWN` 的历史事实。
 
-V3 且 `collectExitInfo=true` 时默认使用当前进程的系统摘要槽，启动写入一次，模块停止/撤回同意时尝试清空。宿主已有其他组件使用该槽时，必须通过新增 overload 关闭 SDK 写入：
+V3 且 `collectExitInfo=true` 时默认使用当前进程的系统摘要槽，启动写入一次，模块停止/撤回同意时尝试清空。身份摘要编码失败（任一字段无法完整容纳 128 字节）时，启动阶段会清除槽内过期的本进程旧值以防未来退出被错误归属，但 SDK 不声明槽位所有权，停止阶段不再二次写入。宿主已有其他组件使用该槽时，必须通过新增 overload 关闭 SDK 写入：
 
 ```kotlin
 Apm.register(CrashModule(CrashConfig(), writeExitIdentitySummary = false))
