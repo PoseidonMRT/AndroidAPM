@@ -128,7 +128,9 @@ class CrashModule(private val config: CrashConfig = CrashConfig()) : ApmModule {
                 val manager = application.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
                 val summary = context.captureExitOccurrence()?.let(ExitOccurrenceSummary::encode)
                 manager?.setProcessStateSummary(summary)
-                wroteExitIdentitySummary = manager != null
+                // 只有真正写入有效摘要才声明槽位所有权；编码失败时的清除不占有槽位，
+                // 避免停止阶段以 null 二次写入覆盖他方后续写入的值。
+                wroteExitIdentitySummary = summary != null && manager != null
                 if (summary == null) context.logger.w("Exit identity cannot fit the platform summary; future exit remains unknown")
             } catch (error: Exception) {
                 Apm.recordInternalError(ERROR_TAG_EXIT_SUMMARY, error)

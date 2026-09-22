@@ -158,6 +158,20 @@ class CrashExitHistoryTest {
         assertNull(manager.summary)
     }
 
+    /** A failed identity write clears the stale slot once and does not claim stop-time cleanup. */
+    @Test
+    fun `oversized identity does not claim summary ownership it never obtained`() {
+        manager.summary = ExitOccurrenceSummary.encode(oldIdentity)
+        val module = CrashModule(CrashConfig(enableJavaCrash = false))
+        start(module, identity = currentIdentity.copy(appBuild = "x".repeat(256)))
+        awaitCollector(module)
+        Apm.stop()
+
+        // 启动时的 null 清除只发生一次；无效写入不声明所有权，停止阶段不再二次写入。
+        assertEquals(1, manager.writes.size)
+        assertNull(manager.summary)
+    }
+
     /** Revocation removes the current process's SDK-owned summary as part of module shutdown. */
     @Test
     fun `consent revocation clears the active process summary`() {
