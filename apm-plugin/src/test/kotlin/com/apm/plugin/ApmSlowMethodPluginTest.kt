@@ -6,6 +6,7 @@ import org.gradle.testfixtures.ProjectBuilder
 import org.objectweb.asm.ClassReader
 import org.objectweb.asm.ClassVisitor
 import org.objectweb.asm.ClassWriter
+import org.objectweb.asm.Label
 import org.objectweb.asm.MethodVisitor
 import org.objectweb.asm.Opcodes
 import java.io.File
@@ -164,6 +165,23 @@ class ApmSlowMethodPluginTest {
         assertFalse(ApmClassTransformer.isInstrumentable("com/example/sub/Foo.class", listOf("com.example.")))
     }
 
+    /** Windows directory paths use backslashes and must obey the same package exclusions. */
+    @Test
+    fun `windows class path separators are normalized before exclusion`() {
+        assertFalse(
+            ApmClassTransformer.isInstrumentable(
+                "android\\app\\Activity.class",
+                listOf("android.")
+            )
+        )
+        assertTrue(
+            ApmClassTransformer.isInstrumentable(
+                "com\\exampleevil\\Foo.class",
+                listOf("com.example")
+            )
+        )
+    }
+
     /** 有效 class 字节码应注入 methodEnter 和 methodExit 调用。 */
     @Test
     fun `valid class bytecode receives tracer enter and exit calls`() {
@@ -196,11 +214,7 @@ class ApmSlowMethodPluginTest {
         assertEquals(2, inspection.calls.count { it == "methodExit" })
     }
 
-    /**
-     * 宿主类层次包含插件 classpath 不存在的 android.* 父类、且方法内存在
-     * 引用类型控制流合并时，COMPUTE_FRAMES 必须解析公共超类型：
-     * 回退 java/lang/Object 后插桩成功，而不是静默返回原始字节。
-     */
+    /** 宿主父类不在插件 classpath 时，保留输入 frame 仍应完成插桩。 */
     @Test
     fun `class extending unresolvable android supertype still receives instrumentation`() {
         val originalBytes = createHostHierarchyClassBytes()
@@ -212,6 +226,27 @@ class ApmSlowMethodPluginTest {
         val calls = collectTracerCalls(transformed)
         assertTrue(calls.contains("methodEnter"))
         assertTrue(calls.contains("methodExit"))
+    }
+
+    /** Preserved merge frames must keep transformed bytecode accepted by the verifier. */
+    @Test
+    fun `unresolvable sibling merge remains verifiable when used through their parent`() {
+        val classes = createUnresolvableClassHierarchy()
+        val transformed = transformClassWithBytes(
+            bytes = classes.getValue("com.example.MergeTarget"),
+            classFilePath = "com/example/MergeTarget.class",
+            config = ApmSlowMethodExtension()
+        )
+        val loader = GeneratedClassLoader(
+            classes +
+                ("com.example.MergeTarget" to transformed) +
+                ("com.apm.slowmethod.ApmSlowMethodTracer" to createTracerStubBytes())
+        )
+
+        val target = loader.loadClass("com.example.MergeTarget")
+        val instance = target.getDeclaredConstructor().newInstance()
+        val result = target.getDeclaredMethod("choose", Boolean::class.javaPrimitiveType).invoke(instance, true)
+        assertEquals(1, result)
     }
 
     // --- 目录转换测试 ---
@@ -387,8 +422,7 @@ class ApmSlowMethodPluginTest {
     }
 
     /**
-     * 构造一个父类在插件 classpath 中不存在（android/app/Activity）、
-     * 且方法内存在引用类型控制流合并的 class：COMPUTE_FRAMES 必须解析公共超类型。
+     * 构造一个父类不在插件 classpath、但携带精确控制流合并 frame 的 class。
      *
      * @return class 字节码。
      */
@@ -413,7 +447,7 @@ class ApmSlowMethodPluginTest {
             visitEnd()
         }
 
-        // 条件分支把 this 与新实例合并到同一局部变量，强制帧计算求公共超类型。
+        // 条件分支把 this 与新实例合并到同一局部变量，输入 frame 已声明 Object 合并类型。
         classWriter.visitMethod(Opcodes.ACC_PUBLIC, "work", "(Z)V", null, null).apply {
             visitCode()
             val elseLabel = org.objectweb.asm.Label()
@@ -425,11 +459,25 @@ class ApmSlowMethodPluginTest {
             visitJumpInsn(Opcodes.GOTO, mergeLabel)
             // else：local2 = new Other()（与 HostActivity 无继承关系的兄弟类型）。
             visitLabel(elseLabel)
+            visitFrame(
+                Opcodes.F_FULL,
+                2,
+                arrayOf("com/example/HostActivity", Opcodes.INTEGER),
+                0,
+                null
+            )
             visitTypeInsn(Opcodes.NEW, "com/example/Other")
             visitInsn(Opcodes.DUP)
             visitMethodInsn(Opcodes.INVOKESPECIAL, "com/example/Other", "<init>", "()V", false)
-            // merge：公共超类型需要解析两个插件 classpath 中都不存在的类。
+            // merge：保留输入提供的公共 Object 类型，不要求插件解析两个宿主类。
             visitLabel(mergeLabel)
+            visitFrame(
+                Opcodes.F_FULL,
+                2,
+                arrayOf("com/example/HostActivity", Opcodes.INTEGER),
+                1,
+                arrayOf("java/lang/Object")
+            )
             visitVarInsn(Opcodes.ASTORE, 2)
             visitVarInsn(Opcodes.ALOAD, 2)
             visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Object", "toString", "()Ljava/lang/String;", false)
@@ -441,6 +489,172 @@ class ApmSlowMethodPluginTest {
 
         classWriter.visitEnd()
         return classWriter.toByteArray()
+    }
+
+    /** Creates a base class, two subclasses, and a caller with an explicit parent merge frame. */
+    private fun createUnresolvableClassHierarchy(): Map<String, ByteArray> {
+        val baseWriter = ClassWriter(0)
+        baseWriter.visit(
+            Opcodes.V1_8,
+            Opcodes.ACC_PUBLIC or Opcodes.ACC_ABSTRACT,
+            "com/example/HostBase",
+            null,
+            "java/lang/Object",
+            null
+        )
+        baseWriter.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null).apply {
+            visitCode()
+            visitVarInsn(Opcodes.ALOAD, 0)
+            visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false)
+            visitInsn(Opcodes.RETURN)
+            visitMaxs(1, 1)
+            visitEnd()
+        }
+        baseWriter.visitMethod(
+            Opcodes.ACC_PUBLIC or Opcodes.ACC_ABSTRACT,
+            "value",
+            "()I",
+            null,
+            null
+        ).visitEnd()
+        baseWriter.visitEnd()
+
+        /** Builds one implementation returning [value]. */
+        fun implementation(name: String, value: Int): ByteArray {
+            val writer = ClassWriter(0)
+            writer.visit(
+                Opcodes.V1_8,
+                Opcodes.ACC_PUBLIC,
+                name.replace('.', '/'),
+                null,
+                "com/example/HostBase",
+                null
+            )
+            writer.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null).apply {
+                visitCode()
+                visitVarInsn(Opcodes.ALOAD, 0)
+                visitMethodInsn(Opcodes.INVOKESPECIAL, "com/example/HostBase", "<init>", "()V", false)
+                visitInsn(Opcodes.RETURN)
+                visitMaxs(1, 1)
+                visitEnd()
+            }
+            writer.visitMethod(Opcodes.ACC_PUBLIC, "value", "()I", null, null).apply {
+                visitCode()
+                visitInsn(value)
+                visitInsn(Opcodes.IRETURN)
+                visitMaxs(1, 1)
+                visitEnd()
+            }
+            writer.visitEnd()
+            return writer.toByteArray()
+        }
+
+        val targetWriter = ClassWriter(0)
+        targetWriter.visit(
+            Opcodes.V1_8,
+            Opcodes.ACC_PUBLIC,
+            "com/example/MergeTarget",
+            null,
+            "java/lang/Object",
+            null
+        )
+        targetWriter.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null).apply {
+            visitCode()
+            visitVarInsn(Opcodes.ALOAD, 0)
+            visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false)
+            visitInsn(Opcodes.RETURN)
+            visitMaxs(1, 1)
+            visitEnd()
+        }
+        targetWriter.visitMethod(
+            Opcodes.ACC_PUBLIC,
+            "choose",
+            "(Z)I",
+            null,
+            null
+        ).apply {
+            visitCode()
+            val elseLabel = Label()
+            val mergeLabel = Label()
+            visitVarInsn(Opcodes.ILOAD, 1)
+            visitJumpInsn(Opcodes.IFEQ, elseLabel)
+            visitTypeInsn(Opcodes.NEW, "com/example/First")
+            visitInsn(Opcodes.DUP)
+            visitMethodInsn(Opcodes.INVOKESPECIAL, "com/example/First", "<init>", "()V", false)
+            visitJumpInsn(Opcodes.GOTO, mergeLabel)
+            visitLabel(elseLabel)
+            visitFrame(
+                Opcodes.F_FULL,
+                2,
+                arrayOf("com/example/MergeTarget", Opcodes.INTEGER),
+                0,
+                null
+            )
+            visitTypeInsn(Opcodes.NEW, "com/example/Second")
+            visitInsn(Opcodes.DUP)
+            visitMethodInsn(Opcodes.INVOKESPECIAL, "com/example/Second", "<init>", "()V", false)
+            visitLabel(mergeLabel)
+            visitFrame(
+                Opcodes.F_FULL,
+                2,
+                arrayOf("com/example/MergeTarget", Opcodes.INTEGER),
+                1,
+                arrayOf("com/example/HostBase")
+            )
+            visitMethodInsn(Opcodes.INVOKEVIRTUAL, "com/example/HostBase", "value", "()I", false)
+            visitInsn(Opcodes.IRETURN)
+            visitMaxs(2, 2)
+            visitEnd()
+        }
+        targetWriter.visitEnd()
+
+        return mapOf(
+            "com.example.HostBase" to baseWriter.toByteArray(),
+            "com.example.First" to implementation("com.example.First", Opcodes.ICONST_1),
+            "com.example.Second" to implementation("com.example.Second", Opcodes.ICONST_2),
+            "com.example.MergeTarget" to targetWriter.toByteArray()
+        )
+    }
+
+    /** Creates a no-op runtime tracer so transformed test classes can execute. */
+    private fun createTracerStubBytes(): ByteArray {
+        val writer = ClassWriter(0)
+        writer.visit(
+            Opcodes.V1_8,
+            Opcodes.ACC_PUBLIC,
+            "com/apm/slowmethod/ApmSlowMethodTracer",
+            null,
+            "java/lang/Object",
+            null
+        )
+        listOf("methodEnter", "methodExit").forEach { methodName ->
+            writer.visitMethod(
+                Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC,
+                methodName,
+                "(Ljava/lang/String;)V",
+                null,
+                null
+            ).apply {
+                visitCode()
+                visitInsn(Opcodes.RETURN)
+                visitMaxs(0, 1)
+                visitEnd()
+            }
+        }
+        writer.visitEnd()
+        return writer.toByteArray()
+    }
+
+    /** Defines generated classes without making their hierarchy visible to the transformer itself. */
+    private class GeneratedClassLoader(
+        /** Generated definitions keyed by binary class name. */
+        private val definitions: Map<String, ByteArray>
+    ) : ClassLoader(ApmSlowMethodPluginTest::class.java.classLoader) {
+        /** Defines a generated class on demand. */
+        override fun findClass(name: String): Class<*> {
+            val bytes = definitions[name] ?: return super.findClass(name)
+            return defineClass(name, bytes, 0, bytes.size)
+        }
     }
 
     /**

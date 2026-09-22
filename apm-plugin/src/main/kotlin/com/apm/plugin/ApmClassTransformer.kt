@@ -31,10 +31,10 @@ object ApmClassTransformer {
     private const val METHOD_EXIT = "methodExit"
     /** 方法签名描述符。 */
     private const val METHOD_DESC = "(Ljava/lang/String;)V"
-    /** 帧计算无法解析宿主类层次时的保守公共超类型（JVM 内部格式）。 */
-    private const val JAVA_LANG_OBJECT = "java/lang/Object"
     /** 点分包名分隔符。 */
     private const val PACKAGE_SEPARATOR = '.'
+    /** Catch-all handler 栈中的异常类型（JVM 内部格式）。 */
+    private const val JAVA_LANG_THROWABLE = "java/lang/Throwable"
 
     /**
      * 创建可复用的 ASM ClassVisitor。
@@ -63,11 +63,20 @@ object ApmClassTransformer {
      * @return true 表示可插桩。
      */
     fun isInstrumentable(className: String, excludePackages: List<String>): Boolean {
-        val normalizedClassName = className
-            .removeSuffix(".class")
-            .replace('/', '.')
+        val normalizedClassName = normalizeClassName(className)
         return excludePackages.none { exclude -> matchesExclude(normalizedClassName, exclude) }
     }
+
+    /**
+     * 将 AGP 点分名、Jar 斜杠路径和 Windows 反斜杠路径统一为点分类名。
+     *
+     * @param className 原始类名或 class 文件路径。
+     * @return 去掉 class 后缀的点分类名。
+     */
+    private fun normalizeClassName(className: String): String = className
+        .removeSuffix(".class")
+        .replace('/', '.')
+        .replace('\\', '.')
 
     /**
      * 单个排除项是否命中目标类名。
@@ -160,9 +169,7 @@ object ApmClassTransformer {
             return bytes
         }
         // 将路径格式转为类名格式：com/example/MyClass.class → com.example.MyClass
-        val fullClassName = className
-            .removeSuffix(".class")
-            .replace('/', '.')
+        val fullClassName = normalizeClassName(className)
 
         // 排除不需要插桩的类
         if (!isInstrumentable(fullClassName, config.excludePackages)) {
@@ -171,27 +178,10 @@ object ApmClassTransformer {
 
         try {
             val classReader = ClassReader(bytes)
-            val classWriter = object : ClassWriter(
+            val classWriter = ClassWriter(
                 classReader,
-                ClassWriter.COMPUTE_MAXS or ClassWriter.COMPUTE_FRAMES
-            ) {
-                /**
-                 * 帧计算解析公共超类型时的安全回退。
-                 *
-                 * ASM 默认实现用插件类加载器加载类；宿主类层次中的 android.* / androidx.*
-                 * 不在插件 classpath，解析会抛异常。帧计算只需保守的公共超类型，
-                 * 回退 java/lang/Object 即可保证输出字节码可验证，避免整个类被静默跳过。
-                 */
-                override fun getCommonSuperClass(type1: String, type2: String): String {
-                    return try {
-                        super.getCommonSuperClass(type1, type2)
-                    } catch (error: Exception) {
-                        JAVA_LANG_OBJECT
-                    } catch (error: LinkageError) {
-                        JAVA_LANG_OBJECT
-                    }
-                }
-            }
+                ClassWriter.COMPUTE_MAXS
+            )
 
             val visitor = ApmClassVisitor(
                 api = Opcodes.ASM9,
@@ -336,6 +326,16 @@ object ApmClassTransformer {
             mv.visitLabel(protectedEnd)
             mv.visitTryCatchBlock(protectedStart, protectedEnd, exceptionHandler, null)
             mv.visitLabel(exceptionHandler)
+            // 保留输入 class 的精确 StackMapFrame，只为新增 handler 声明最小安全帧。
+            // handler 不读取任一局部变量，因此全部 locals 取 TOP（用空 trailing locals 表示）；
+            // 栈上仅保留 JVM 交给 catch-all 的 Throwable，不需要解析宿主类层次。
+            mv.visitFrame(
+                Opcodes.F_NEW,
+                0,
+                emptyArray(),
+                1,
+                arrayOf(JAVA_LANG_THROWABLE)
+            )
             emitMethodExit()
             mv.visitInsn(Opcodes.ATHROW)
             super.visitMaxs(maxStack, maxLocals)

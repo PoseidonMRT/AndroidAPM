@@ -1,6 +1,6 @@
 # Android APM 项目文档
 
-> 文档同步：2026-09-12｜27 个构建单元｜169 个主源码文件（164 Kotlin + 4 C + 1 proto）｜113 个测试/benchmark 文件
+> 文档同步：2026-09-23｜27 个构建单元｜169 个主源码文件（164 Kotlin + 4 C + 1 proto）｜113 个测试/benchmark 文件
 
 ## 一、项目结论
 
@@ -21,6 +21,15 @@ monitor module
 ```
 
 Crash/ANR 关键事件通过 `Apm.emitCriticalSync` 绕过共享队列、采样、聚合与限流，同步到 SQLite 或 critical IPC hand-off point；较低调用方 priority 自动提升为 CRITICAL，返回成功前不执行网络 IO。上传进程消费 CRITICAL IPC 时仍同步落 store，只有下游接受后删除 ready 文件；false、recoverable 存储失败或 consumer 未就绪会保留整文件重试，已发布 `.ipc` 不按年龄先行删除，只有未完成 `.tmp` 在 5 分钟后清理。每个事件拥有稳定 `eventId`，上传 Worker 原子 claim 后由 owner ACK/失败释放，租约过期可重领。上传成功后删除，失败保留并重试；这是 at-least-once，不是 exactly-once，网络响应不确定或整文件重试时服务端仍须按 `eventId` 去重。
+
+## 2026-09-23 对前一日修改的复核
+
+逐项复核 2026-09-22 的五个本地提交后，插件延迟注册、包边界排除和 app-exit 摘要所有权方向正确，另确认并修复两个必须阻止发布的问题：
+
+1. 独立 `transformJar`/`transformDirectory` 在插件 classpath 无法解析宿主兄弟类型时曾回退 `java/lang/Object`。该结果虽然包含 tracer 调用，但当原方法随后按真实共同父类调用时会在 JVM 类加载阶段触发 `VerifyError`。转换器现保留输入 class 的精确 StackMapFrame，只使用 `COMPUTE_MAXS`，并给新增 catch-all handler 写入不读取 locals 的最小 Throwable frame；回归会定义完整宿主层次、加载并实际执行转换结果。
+2. 包名归一化只处理 `/`，Windows `transformDirectory` 产生的反斜杠 class 路径可能绕过 `android.*` 等排除项。现在点分名、Jar 斜杠和 Windows 反斜杠路径进入同一包边界判断，并有直接回归覆盖。
+
+JDK 17 定向验证通过 included plugin 1 suite / 23 tests、plugin `apiCheck`、crash 6 suites / 28 tests、crash `apiCheck` 和文档 46 Markdown / 70 links。为验证实际声明顺序，临时把 sample 的慢方法插件放在 Android application 插件之前，Debug 构建仍完成 451 个强制任务、`transformDebugClassesWithAsm` 和 APK 打包；验证后构建脚本已恢复原顺序。该证据证明本机 Gradle/JVM 插桩链，不替代 ART/OEM 真机执行。
 
 ## 2026-09-12 审查修复与最终验收
 

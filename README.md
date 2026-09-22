@@ -374,7 +374,7 @@ apmSlowMethod {
 }
 ```
 
-`plugins{}` 中 `com.apm.slow-method` 可先可后于 Android 插件声明：插桩通过 `withPlugin` 延迟到 Android 插件就位后注册，顺序不再影响生效。`excludePackages` 采用包边界语义——不带尾点的 `com.example` 只排除其包及子包，不会误排 `com.exampleevil.*`；带尾点写法维持原前缀语义。
+`plugins{}` 中 `com.apm.slow-method` 可先可后于 Android 插件声明：插桩通过 `withPlugin` 延迟到 Android 插件就位后注册，顺序不再影响生效。`excludePackages` 采用包边界语义——不带尾点的 `com.example` 只排除其包及子包，不会误排 `com.exampleevil.*`；带尾点写法维持原前缀语义，Windows 目录路径的反斜杠也会在匹配前归一化。独立 `transformJar`/`transformDirectory` 路径保留输入 class 的精确 StackMapFrame，只重算最大栈并为新增异常 handler 写入最小安全帧，避免插件 classpath 无法解析宿主继承层次时生成不可验证字节码。
 
 ## 重要默认值
 

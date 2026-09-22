@@ -1,6 +1,6 @@
 # apm-slow-method 与 apm-plugin
 
-> 同步日期：2026-09-22｜运行时模块：`slow_method`
+> 同步日期：2026-09-23｜运行时模块：`slow_method`
 
 ## 三条观测路径
 
@@ -27,7 +27,7 @@ AGP instrumentation scope PROJECT
 
 只插桩当前 project，默认排除 Android/AndroidX/Kotlin/Java/APM tracer 包。排除项为包边界语义：不带尾点的 `com.example` 只匹配其包及子包，不会误排 `com.exampleevil.*`。AGP 重算被插桩方法 frames。
 
-独立字节码转换路径（公开 API `transformJar`/`transformDirectory`）使用 `COMPUTE_FRAMES`；宿主类层次中的 `android.*` 不在插件 classpath，`getCommonSuperClass` 解析失败时回退保守的 `java/lang/Object`，不再静默返回原始字节。
+独立字节码转换路径（公开 API `transformJar`/`transformDirectory`）保留输入 class 的精确 StackMapFrame，只用 `COMPUTE_MAXS` 重算最大栈，并为新增 catch-all handler 写入不读取 locals 的最小 Throwable frame。该路径不再用插件 ClassLoader 解析宿主类层次，也不会把未知兄弟类型一律合并成 `java/lang/Object`；后者会在原代码随后按共同父类调用方法时生成 JVM/ART 无法验证的字节码。Windows 目录路径的反斜杠会先归一化为点分类名，再执行与 Jar/AGP 一致的包边界排除。
 
 ## 运行时 tracer
 
@@ -55,11 +55,11 @@ Looper hook 回调在主线程，只做计时/触发；stack sampling 在独立 
 - 注册 `SlowMethodModule` 不会自动让所有方法 ASM 化；Gradle 插件是独立接线。
 - Looper hook 只能定位 message dispatch 粒度。
 - stack sampling 是统计近似，不保证命中真实最慢方法。
-- 插件 transform 的工具方法在无法恢复的字节码损坏时仍返回原 class；帧计算的类解析失败已改为回退 `java/lang/Object`，AGP visitor 路径的失败表现由构建系统决定。
+- 插件 transform 的工具方法在无法恢复的字节码损坏时仍返回原 class；有效输入的既有 frames 会保留，新增 handler frame 不依赖宿主 classpath，AGP visitor 路径仍由构建系统重算被插桩方法 frames。
 
 ## 测试
 
-Module/config/tracer 测试覆盖运行时；`apm-plugin` 独立测试验证过滤、方法签名、正常返回、显式/传播异常的 exit 平衡，以及插件延迟注册（无 Android 插件时安全）、不可解析宿主父类的帧回退插桩、排除包名的包边界语义。
+Module/config/tracer 测试覆盖运行时；`apm-plugin` 独立测试验证过滤、方法签名、正常返回、显式/传播异常的 exit 平衡，以及插件延迟注册（无 Android 插件时安全）、不可解析宿主兄弟类型合并后仍能由 JVM 加载执行、Windows 路径归一化和排除包名的包边界语义。真实 sample 还以慢方法插件先于 Android 插件的声明顺序完成 Debug ASM transformation。
 
 ## 时间语义
 
