@@ -30,8 +30,15 @@ class ApmSlowMethodPlugin : Plugin<Project> {
     /** 插件扩展配置。 */
     lateinit var extension: ApmSlowMethodExtension
 
+    /** 防止 application/library 同时存在时重复注册插桩。 */
+    private var instrumentationRegistered = false
+
     /**
-     * 应用插件并注册 AGP ASM instrumentation。
+     * 应用插件并延迟注册 AGP ASM instrumentation。
+     *
+     * 通过 [org.gradle.api.plugins.PluginManager.withPlugin] 等待 Android 插件就位：
+     * 宿主 `plugins{}` 中先应用 `com.apm.slow-method` 再应用 Android 插件时，
+     * apply() 阶段 [AndroidComponentsExtension] 尚不存在，立即查询会静默跳过插桩注册。
      *
      * @param project 当前 Gradle project。
      */
@@ -42,12 +49,42 @@ class ApmSlowMethodPlugin : Plugin<Project> {
             ApmSlowMethodExtension::class.java
         )
 
+        // 延迟到 Android 插件应用后再注册插桩，插件声明顺序不再影响结果。
+        project.pluginManager.withPlugin(ANDROID_APPLICATION_PLUGIN_ID) {
+            registerInstrumentation(project)
+        }
+        project.pluginManager.withPlugin(ANDROID_LIBRARY_PLUGIN_ID) {
+            registerInstrumentation(project)
+        }
+        project.pluginManager.withPlugin(ANDROID_DYNAMIC_FEATURE_PLUGIN_ID) {
+            registerInstrumentation(project)
+        }
+
+        // 非 Android module 应用插件时给出明确诊断，保持原有可观测性。
+        project.afterEvaluate { evaluated ->
+            if (!evaluated.plugins.hasPlugin(ANDROID_APPLICATION_PLUGIN_ID) &&
+                !evaluated.plugins.hasPlugin(ANDROID_LIBRARY_PLUGIN_ID) &&
+                !evaluated.plugins.hasPlugin(ANDROID_DYNAMIC_FEATURE_PLUGIN_ID)
+            ) {
+                evaluated.logger.warn(
+                    "APM SlowMethod Plugin requires an Android application, library, or dynamic-feature plugin"
+                )
+            }
+        }
+    }
+
+    /** AGP 可用后为所有 variant 注册 ASM 插桩；重复回调只生效一次。 */
+    private fun registerInstrumentation(project: Project) {
+        if (instrumentationRegistered) {
+            return
+        }
         val androidComponents = project.extensions.findByType(AndroidComponentsExtension::class.java)
         if (androidComponents == null) {
-            // 只支持 Android module；非 Android module 应用插件时给出明确日志。
+            // 理论上 withPlugin 触发时扩展必然存在；保留兜底诊断。
             project.logger.warn("APM SlowMethod Plugin requires Android Gradle Plugin")
             return
         }
+        instrumentationRegistered = true
 
         androidComponents.onVariants { variant ->
             // 仅插桩当前 project，避免把 APM SDK 依赖类插桩后造成 Tracer 递归。
@@ -70,6 +107,15 @@ class ApmSlowMethodPlugin : Plugin<Project> {
     companion object {
         /** 插件扩展名。 */
         private const val EXTENSION_NAME = "apmSlowMethod"
+
+        /** Android application 插件 id。 */
+        private const val ANDROID_APPLICATION_PLUGIN_ID = "com.android.application"
+
+        /** Android library 插件 id。 */
+        private const val ANDROID_LIBRARY_PLUGIN_ID = "com.android.library"
+
+        /** Android dynamic-feature 插件 id。 */
+        private const val ANDROID_DYNAMIC_FEATURE_PLUGIN_ID = "com.android.dynamic-feature"
     }
 }
 

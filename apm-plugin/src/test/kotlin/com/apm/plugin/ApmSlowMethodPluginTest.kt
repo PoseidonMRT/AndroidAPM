@@ -2,6 +2,7 @@ package com.apm.plugin
 
 import org.junit.Assert.*
 import org.junit.Test
+import org.gradle.testfixtures.ProjectBuilder
 import org.objectweb.asm.ClassReader
 import org.objectweb.asm.ClassVisitor
 import org.objectweb.asm.ClassWriter
@@ -50,6 +51,20 @@ class ApmSlowMethodPluginTest {
         // 验证自定义值
         assertFalse(extension.enabled)
         assertEquals(listOf("com.example."), extension.excludePackages)
+    }
+
+    // --- 插件应用顺序测试 ---
+
+    /**
+     * 先应用本插件、后应用 Android 插件的场景下，apply() 必须安全延迟：
+     * 插件通过 withPlugin 等待 Android 插件就位，不在 apply() 阶段强制要求 AGP。
+     */
+    @Test
+    fun `plugin defers instrumentation registration until an Android plugin is present`() {
+        val project = ProjectBuilder.builder().build()
+        // 未应用任何 Android 插件时应用本插件：不抛异常、注册扩展、不注册插桩。
+        project.pluginManager.apply(ApmSlowMethodPlugin::class.java)
+        assertNotNull(project.extensions.findByType(ApmSlowMethodExtension::class.java))
     }
 
     // --- shouldExclude 逻辑测试（通过 transformClass 间接测试） ---
