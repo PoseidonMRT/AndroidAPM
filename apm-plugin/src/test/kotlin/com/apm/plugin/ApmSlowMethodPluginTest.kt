@@ -184,6 +184,24 @@ class ApmSlowMethodPluginTest {
         assertEquals(2, inspection.calls.count { it == "methodExit" })
     }
 
+    /**
+     * 宿主类层次包含插件 classpath 不存在的 android.* 父类、且方法内存在
+     * 引用类型控制流合并时，COMPUTE_FRAMES 必须解析公共超类型：
+     * 回退 java/lang/Object 后插桩成功，而不是静默返回原始字节。
+     */
+    @Test
+    fun `class extending unresolvable android supertype still receives instrumentation`() {
+        val originalBytes = createHostHierarchyClassBytes()
+        val transformed = transformClassWithBytes(
+            bytes = originalBytes,
+            classFilePath = "com/example/HostActivity.class",
+            config = ApmSlowMethodExtension()
+        )
+        val calls = collectTracerCalls(transformed)
+        assertTrue(calls.contains("methodEnter"))
+        assertTrue(calls.contains("methodExit"))
+    }
+
     // --- 目录转换测试 ---
 
     /** 转换目录时非 class 文件应原样复制。 */
@@ -349,6 +367,63 @@ class ApmSlowMethodPluginTest {
             visitCode()
             visitInsn(Opcodes.RETURN)
             visitMaxs(0, 1)
+            visitEnd()
+        }
+
+        classWriter.visitEnd()
+        return classWriter.toByteArray()
+    }
+
+    /**
+     * 构造一个父类在插件 classpath 中不存在（android/app/Activity）、
+     * 且方法内存在引用类型控制流合并的 class：COMPUTE_FRAMES 必须解析公共超类型。
+     *
+     * @return class 字节码。
+     */
+    private fun createHostHierarchyClassBytes(): ByteArray {
+        val classWriter = ClassWriter(0)
+        classWriter.visit(
+            Opcodes.V1_8,
+            Opcodes.ACC_PUBLIC,
+            "com/example/HostActivity",
+            null,
+            "android/app/Activity",
+            null
+        )
+
+        // 构造函数调用不可解析的父类 <init>，仅作为字节码引用存在。
+        classWriter.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null).apply {
+            visitCode()
+            visitVarInsn(Opcodes.ALOAD, 0)
+            visitMethodInsn(Opcodes.INVOKESPECIAL, "android/app/Activity", "<init>", "()V", false)
+            visitInsn(Opcodes.RETURN)
+            visitMaxs(1, 1)
+            visitEnd()
+        }
+
+        // 条件分支把 this 与新实例合并到同一局部变量，强制帧计算求公共超类型。
+        classWriter.visitMethod(Opcodes.ACC_PUBLIC, "work", "(Z)V", null, null).apply {
+            visitCode()
+            val elseLabel = org.objectweb.asm.Label()
+            val mergeLabel = org.objectweb.asm.Label()
+            visitVarInsn(Opcodes.ILOAD, 1)
+            visitJumpInsn(Opcodes.IFEQ, elseLabel)
+            // then：local2 = this（HostActivity 类型）。
+            visitVarInsn(Opcodes.ALOAD, 0)
+            visitJumpInsn(Opcodes.GOTO, mergeLabel)
+            // else：local2 = new Other()（与 HostActivity 无继承关系的兄弟类型）。
+            visitLabel(elseLabel)
+            visitTypeInsn(Opcodes.NEW, "com/example/Other")
+            visitInsn(Opcodes.DUP)
+            visitMethodInsn(Opcodes.INVOKESPECIAL, "com/example/Other", "<init>", "()V", false)
+            // merge：公共超类型需要解析两个插件 classpath 中都不存在的类。
+            visitLabel(mergeLabel)
+            visitVarInsn(Opcodes.ASTORE, 2)
+            visitVarInsn(Opcodes.ALOAD, 2)
+            visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/Object", "toString", "()Ljava/lang/String;", false)
+            visitInsn(Opcodes.POP)
+            visitInsn(Opcodes.RETURN)
+            visitMaxs(2, 3)
             visitEnd()
         }
 

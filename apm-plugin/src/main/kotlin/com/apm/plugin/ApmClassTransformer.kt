@@ -31,6 +31,8 @@ object ApmClassTransformer {
     private const val METHOD_EXIT = "methodExit"
     /** 方法签名描述符。 */
     private const val METHOD_DESC = "(Ljava/lang/String;)V"
+    /** 帧计算无法解析宿主类层次时的保守公共超类型（JVM 内部格式）。 */
+    private const val JAVA_LANG_OBJECT = "java/lang/Object"
 
     /**
      * 创建可复用的 ASM ClassVisitor。
@@ -147,10 +149,27 @@ object ApmClassTransformer {
 
         try {
             val classReader = ClassReader(bytes)
-            val classWriter = ClassWriter(
+            val classWriter = object : ClassWriter(
                 classReader,
                 ClassWriter.COMPUTE_MAXS or ClassWriter.COMPUTE_FRAMES
-            )
+            ) {
+                /**
+                 * 帧计算解析公共超类型时的安全回退。
+                 *
+                 * ASM 默认实现用插件类加载器加载类；宿主类层次中的 android.* / androidx.*
+                 * 不在插件 classpath，解析会抛异常。帧计算只需保守的公共超类型，
+                 * 回退 java/lang/Object 即可保证输出字节码可验证，避免整个类被静默跳过。
+                 */
+                override fun getCommonSuperClass(type1: String, type2: String): String {
+                    return try {
+                        super.getCommonSuperClass(type1, type2)
+                    } catch (error: Exception) {
+                        JAVA_LANG_OBJECT
+                    } catch (error: LinkageError) {
+                        JAVA_LANG_OBJECT
+                    }
+                }
+            }
 
             val visitor = ApmClassVisitor(
                 api = Opcodes.ASM9,
