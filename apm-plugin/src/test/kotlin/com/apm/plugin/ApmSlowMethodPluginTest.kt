@@ -152,6 +152,18 @@ class ApmSlowMethodPluginTest {
         assertTrue(ApmClassTransformer.isInstrumentable("com/example/MyClass.class", listOf("com.apm.slowmethod.")))
     }
 
+    /** 不带尾点的排除项只匹配其包及子包，不错误排除共享前缀的无关包。 */
+    @Test
+    fun `exclude without trailing dot respects package boundary`() {
+        // 共享前缀但不同包：两种写法都不应排除。
+        assertTrue(ApmClassTransformer.isInstrumentable("com/exampleevil/Foo.class", listOf("com.example")))
+        assertTrue(ApmClassTransformer.isInstrumentable("com/exampleevil/Foo.class", listOf("com.example.")))
+        // 排除项自己的包及子包：两种写法都应排除。
+        assertFalse(ApmClassTransformer.isInstrumentable("com/example/Foo.class", listOf("com.example")))
+        assertFalse(ApmClassTransformer.isInstrumentable("com/example/sub/Foo.class", listOf("com.example")))
+        assertFalse(ApmClassTransformer.isInstrumentable("com/example/sub/Foo.class", listOf("com.example.")))
+    }
+
     /** 有效 class 字节码应注入 methodEnter 和 methodExit 调用。 */
     @Test
     fun `valid class bytecode receives tracer enter and exit calls`() {

@@ -33,6 +33,8 @@ object ApmClassTransformer {
     private const val METHOD_DESC = "(Ljava/lang/String;)V"
     /** 帧计算无法解析宿主类层次时的保守公共超类型（JVM 内部格式）。 */
     private const val JAVA_LANG_OBJECT = "java/lang/Object"
+    /** 点分包名分隔符。 */
+    private const val PACKAGE_SEPARATOR = '.'
 
     /**
      * 创建可复用的 ASM ClassVisitor。
@@ -53,6 +55,9 @@ object ApmClassTransformer {
     /**
      * 判断类是否应参与插桩。
      *
+     * 排除项采用包边界语义：不带尾点的排除项只匹配其包及子包，
+     * 避免 "com.example" 误排 "com.exampleevil.*" 这类共享前缀的无关包。
+     *
      * @param className 点分、斜杠或 class 文件路径格式类名。
      * @param excludePackages 排除包名前缀。
      * @return true 表示可插桩。
@@ -61,7 +66,24 @@ object ApmClassTransformer {
         val normalizedClassName = className
             .removeSuffix(".class")
             .replace('/', '.')
-        return excludePackages.none { normalizedClassName.startsWith(it) }
+        return excludePackages.none { exclude -> matchesExclude(normalizedClassName, exclude) }
+    }
+
+    /**
+     * 单个排除项是否命中目标类名。
+     *
+     * @param normalizedClassName 已归一化为点分格式的类名。
+     * @param exclude 排除项，可带或不带尾点。
+     * @return true 表示该类被此排除项命中。
+     */
+    private fun matchesExclude(normalizedClassName: String, exclude: String): Boolean {
+        if (!normalizedClassName.startsWith(exclude)) {
+            return false
+        }
+        // 带尾点的排除项维持历史前缀语义；不带尾点必须命中包边界才排除。
+        return exclude.endsWith(PACKAGE_SEPARATOR) ||
+            exclude.length == normalizedClassName.length ||
+            normalizedClassName[exclude.length] == PACKAGE_SEPARATOR
     }
 
     /**
