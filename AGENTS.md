@@ -18,7 +18,9 @@ This is the repository-local handoff entry for AndroidAPM. Treat the current sou
 
 ## Current Verified Baseline
 
-2026-10-13 深度审查按 16 项问题推进修复：清理与新 init 的所有权、旧 ANR/Hprof/Launch 回调的会话隔离、WebView 宿主回调与后台线程约束、页面/资源/文件容量、HTTP 响应体与内存 retry 生命周期、签名配置 scope、完整 Header 脱敏、ART Hprof 流式布局、Native handler 重启以及 Launch 时钟。既有 wire/codec/SQLite schema 保持；ABI 仅手工追加两个 ApmContext synthetic 会话交接 overload。 逐项计划、实际验证与限制见 [本轮审查记录](docs/REVIEW_2026_10_13.md)。
+2026-10-13 最终本地验收（JDK 17.0.14，源码 e0b75c1）：`python tools/verify_ci.py` 完整通过。强制 Android 113 suites / 803 tests、model 5 / 60、included plugin 1 / 23，共 119 suites / 886 tests，均 0 failures/errors/skips；根/plugin API check、24 份 ABI 基线、四组严格依赖元数据、5 项 release verifier 与 41 项 benchmark/device-lab host tests 通过。本地候选为 25 coordinates / 22 AAR / 26 JAR / 25 POM，sourceRevision=e0b75c13e72ed866a793c7702853b094fce7eb68、sourceDirty=false；独立 consumer 使用 --refresh-dependencies 完成 clean assembleDebug 和 ASM transformation。sample Debug、benchmark Release 与 Release AndroidTest Kotlin 编译通过；八个受影响模块 lint 无错误，警告明细见审查记录；文档 47 Markdown / 79 links 通过。本机无连接设备且缺少 AndroidAPM-Server，本轮未执行真机或 Collector E2E，也未向外部 Maven 发布。
+
+2026-10-13 深度审查已完成 16 项问题修复：清理与新 init 的所有权、旧 ANR/Hprof/Launch 回调的会话隔离、WebView 宿主回调与后台线程约束、页面/资源/文件容量、HTTP 响应体与内存 retry 生命周期、签名配置 scope、完整 Header 脱敏、ART Hprof 流式布局、Native handler 重启以及 Launch 时钟。既有 wire/codec/SQLite schema 保持；ABI 仅手工追加两个 ApmContext synthetic 会话交接 overload。 逐项计划、实际验证与限制见 [本轮审查记录](docs/REVIEW_2026_10_13.md)。
 
 2026-09-23 对 2026-09-22 五个本地提交逐项复核：插件延迟注册、包边界排除和 app-exit 摘要所有权方向正确；实证发现并修复两个遗漏。独立 `transformJar`/`transformDirectory` 把不可解析兄弟类型一律合并成 `java/lang/Object` 时，原代码随后按共同父类调用会在类加载阶段触发 `VerifyError`；现改为保留输入 StackMapFrame、仅 `COMPUTE_MAXS`，并给新增 catch-all handler 写入不读取 locals 的最小 Throwable frame。Windows 目录 class 路径的反斜杠现与 Jar/AGP 路径统一归一化，不能再绕过包排除。回归会真实加载并执行不可解析层次的转换结果，而非只搜索 tracer 调用。JDK 17 下 included plugin 1 suite / 23 tests、plugin apiCheck、crash 6 suites / 28 tests、crash apiCheck、文档 46 Markdown / 70 links 均通过；将慢方法插件置于 Android application 插件之前后，sample Debug 仍完成 451 个强制任务和 `transformDebugClassesWithAsm`。该结果是 JVM/构建验证，不替代 ART/OEM 真机。
 

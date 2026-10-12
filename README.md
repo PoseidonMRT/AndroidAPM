@@ -4,7 +4,7 @@
 
 > 当前边界：本仓库负责 Android 端采集、保护、持久化和传输，不包含生产 Collector、查询/告警后台、Native 符号化服务或托管平台。
 
-本轮深度审查覆盖生命周期隔离、WebView 宿主行为、上传边界、签名配置与 Hprof 长稳资源等 16 项缺陷；逐项计划、验证和限制见 [审查记录](docs/REVIEW_2026_10_13.md)。
+2026-10-13 深度审查已修复生命周期隔离、WebView 宿主行为、上传边界、签名配置与 Hprof 长稳资源等 16 项缺陷。完整客户端门禁、886 项 Android/model/plugin 测试、示例与 benchmark 编译通过，候选 sourceDirty=false；本轮未执行真机与 Collector E2E。逐项计划、提交、验证和限制见 [审查记录](docs/REVIEW_2026_10_13.md)。
 
 历史完整客户端门禁（2026-09-12，源码 62665ae）通过：Android/model/plugin 共 817 项测试，零失败/错误/跳过；ABI、严格依赖校验、Maven 候选与独立消费、示例/benchmark 构建、文档和真实 V2/V3 Collector 联调均通过。候选记录 sourceDirty=false；本地证据不替代真机及生产验收。
 
