@@ -1,8 +1,10 @@
 # AndroidAPM 项目交接快照
 
-> 同步日期：2026-09-12｜分支：`develop`｜当前 tip 请执行 `git log --oneline -n 10`
+> 同步日期：2026-10-13｜分支：`develop`｜当前 tip 请执行 `git log --oneline -n 10`
 
 ## 结论
+
+2026-10-13 深度审查按 16 项问题推进修复：清理与新 init 的所有权、旧 ANR/Hprof/Launch 回调的会话隔离、WebView 宿主回调与后台线程约束、页面/资源/文件容量、HTTP 响应体与内存 retry 生命周期、签名配置 scope、完整 Header 脱敏、ART Hprof 流式布局、Native handler 重启以及 Launch 时钟。既有 wire/codec/SQLite schema 保持；ABI 仅手工追加两个 ApmContext synthetic 会话交接 overload。 逐项计划、实际验证与限制见 [本轮审查记录](REVIEW_2026_10_13.md)。
 
 最终整合验收（2026-09-12，JDK 17.0.14，源码 62665ae）：python tools/verify_ci.py 完整通过。强制重跑 Android 105 suites / 739 tests、model 5 / 60、included plugin 1 / 18，共 817 tests，均 0 failures/errors/skips。根/plugin apiCheck、全部 24 ABI 基线、4 组严格依赖元数据、5 项发布候选 verifier 测试与 41 项 benchmark/device-lab host 测试通过。本地 Maven 候选为 25 coordinates / 22 AAR / 26 JAR / 25 POM，manifest 的 sourceRevision=62665aecc0388df355439a9531c88badb816d3c5、sourceDirty=false；独立 consumer 使用 --refresh-dependencies clean assembleDebug 完成 ASM transformation。sample debug、benchmark release 与 AndroidTest Kotlin 编译通过。verify_collector_e2e.py 对 AndroidAPM-Server 的干净提交 24f5b8b4a6a2de12e29887421362e53558783133 完成真实 V2/V3 Gzip HTTP、exact ACK、typed/occurrence 持久化、installation HMAC 与重放去重。文档检查为 46 Markdown / 70 links。各项受影响模块 lint 无错误；保留 memory 的两条 ObsoleteSdkInt 与 crash 的一条 UseRequiresApi 既有警告。无物理设备连接；该结果不代表真机长稳、Native signal 或生产 PostgreSQL/TLS/SigNoz 接受，也未向外部 Maven 发布。
 
@@ -42,8 +44,8 @@
 | 监控模块 | 15 |
 | 扩展模块 | 2 |
 | 分发 Bundle | 1：`apm-bundle` |
-| 主源码 | 169：164 Kotlin + 4 C + 1 proto |
-| 测试/benchmark 文件 | 113 |
+| 主源码 | 170：165 Kotlin + 4 C + 1 proto |
+| 测试/benchmark 文件 | 121 |
 | Gradle runtime | JDK 17+ |
 | Java toolchain | 17 |
 | Gradle / AGP / Kotlin | 8.13 / 8.13.2 / 2.2.21 |

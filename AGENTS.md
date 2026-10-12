@@ -18,6 +18,8 @@ This is the repository-local handoff entry for AndroidAPM. Treat the current sou
 
 ## Current Verified Baseline
 
+2026-10-13 深度审查按 16 项问题推进修复：清理与新 init 的所有权、旧 ANR/Hprof/Launch 回调的会话隔离、WebView 宿主回调与后台线程约束、页面/资源/文件容量、HTTP 响应体与内存 retry 生命周期、签名配置 scope、完整 Header 脱敏、ART Hprof 流式布局、Native handler 重启以及 Launch 时钟。既有 wire/codec/SQLite schema 保持；ABI 仅手工追加两个 ApmContext synthetic 会话交接 overload。 逐项计划、实际验证与限制见 [本轮审查记录](docs/REVIEW_2026_10_13.md)。
+
 2026-09-23 对 2026-09-22 五个本地提交逐项复核：插件延迟注册、包边界排除和 app-exit 摘要所有权方向正确；实证发现并修复两个遗漏。独立 `transformJar`/`transformDirectory` 把不可解析兄弟类型一律合并成 `java/lang/Object` 时，原代码随后按共同父类调用会在类加载阶段触发 `VerifyError`；现改为保留输入 StackMapFrame、仅 `COMPUTE_MAXS`，并给新增 catch-all handler 写入不读取 locals 的最小 Throwable frame。Windows 目录 class 路径的反斜杠现与 Jar/AGP 路径统一归一化，不能再绕过包排除。回归会真实加载并执行不可解析层次的转换结果，而非只搜索 tracer 调用。JDK 17 下 included plugin 1 suite / 23 tests、plugin apiCheck、crash 6 suites / 28 tests、crash apiCheck、文档 46 Markdown / 70 links 均通过；将慢方法插件置于 Android application 插件之前后，sample Debug 仍完成 451 个强制任务和 `transformDebugClassesWithAsm`。该结果是 JVM/构建验证，不替代 ART/OEM 真机。
 
 最终整合验收（2026-09-12，JDK 17.0.14，源码 62665ae）：python tools/verify_ci.py 完整通过。强制重跑 Android 105 suites / 739 tests、model 5 / 60、included plugin 1 / 18，共 817 tests，均 0 failures/errors/skips。根/plugin apiCheck、全部 24 ABI 基线、4 组严格依赖元数据、5 项发布候选 verifier 测试与 41 项 benchmark/device-lab host 测试通过。本地 Maven 候选为 25 coordinates / 22 AAR / 26 JAR / 25 POM，manifest 的 sourceRevision=62665aecc0388df355439a9531c88badb816d3c5、sourceDirty=false；独立 consumer 使用 --refresh-dependencies clean assembleDebug 完成 ASM transformation。sample debug、benchmark release 与 AndroidTest Kotlin 编译通过。verify_collector_e2e.py 对 AndroidAPM-Server 的干净提交 24f5b8b4a6a2de12e29887421362e53558783133 完成真实 V2/V3 Gzip HTTP、exact ACK、typed/occurrence 持久化、installation HMAC 与重放去重。文档检查为 46 Markdown / 70 links。各项受影响模块 lint 无错误；保留 memory 的两条 ObsoleteSdkInt 与 crash 的一条 UseRequiresApi 既有警告。无物理设备连接；该结果不代表真机长稳、Native signal 或生产 PostgreSQL/TLS/SigNoz 接受，也未向外部 Maven 发布。 此结果替代下方 2026-09-07 的历史完整门禁；八项修复已各自提交并推送。
@@ -43,13 +45,13 @@ Review hardening on `2026-09-07` closes eight reproduced issues: HTTP shutdown g
 
 Fresh full gate on `2026-09-07` under JDK `17.0.14` supersedes the historical full-gate entries below: `python tools/verify_ci.py` passed end to end, including forced Android `101` suites / `700` tests, model `5` / `57`, plugin `1` / `18`, all with zero failures/errors/skips; root/plugin API checks, all `24` baselines, four strict dependency-metadata sets, `5` release-candidate verifier tests and `41` benchmark/device-lab host tests; `25` candidate coordinates / `22` AAR / `26` JAR / `25` POM and isolated consumer `--refresh-dependencies clean assembleDebug` with ASM transformation. Focused core/storage/uploader/network/fps lint reports zero issues; sample debug, benchmark release and AndroidTest Kotlin compilation pass. Real cross-repository `verify_collector_e2e.py` also passes V2/V3 Gzip/exact ACK/typed and occurrence persistence/installation HMAC/replay deduplication against temporary SQLite. Final docs verification covers `46` Markdown files / `70` links. Candidate evidence records `sourceDirty=true`; no external Maven release, physical device or production PostgreSQL/TLS/SigNoz acceptance is claimed.
 
-- Documentation synchronization date: `2026-09-12`
+- Documentation synchronization date: `2026-10-13`
 - Branch: `develop`; use `git log --oneline -n 10` for the current tip
 - Runtime tip: use `git log --oneline -n 10`; the signed remote-config milestone and docs share one delivery commit
 - Build units: `27`
 - Composition: `25` root Gradle subprojects (`5` foundation + `15` monitoring + `2` extension + `1` distribution bundle + `apm-sample-app` + non-published `apm-benchmark`) and `2` included builds (`apm-plugin`, `build-logic`)
-- Main source files: `169` (`164` Kotlin + `4` C + `1` proto)
-- Test/benchmark files: `113`
+- Main source files: `170` (`165` Kotlin + `4` C + `1` proto)
+- Test/benchmark files: `121`
 - Toolchain: Java `17`; Gradle runtime JDK `17+`; Gradle `8.13`, AGP `8.13.2`, Kotlin `2.2.21`
 - Android: compileSdk `34`, minSdk `24`, targetSdk `34`; JVM bytecode target `17`
 - The root build, both included builds, and the isolated Maven consumer use Java `17` toolchains without rejecting newer Gradle-compatible JDK runtimes; Java and Kotlin compilation targets Java `17` bytecode.

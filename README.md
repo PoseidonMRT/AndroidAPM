@@ -4,7 +4,9 @@
 
 > 当前边界：本仓库负责 Android 端采集、保护、持久化和传输，不包含生产 Collector、查询/告警后台、Native 符号化服务或托管平台。
 
-本轮完整客户端门禁（2026-09-12，源码 62665ae）通过：Android/model/plugin 共 817 项测试，零失败/错误/跳过；ABI、严格依赖校验、Maven 候选与独立消费、示例/benchmark 构建、文档和真实 V2/V3 Collector 联调均通过。候选记录 sourceDirty=false；本地证据不替代真机及生产验收。
+本轮深度审查覆盖生命周期隔离、WebView 宿主行为、上传边界、签名配置与 Hprof 长稳资源等 16 项缺陷；逐项计划、验证和限制见 [审查记录](docs/REVIEW_2026_10_13.md)。
+
+历史完整客户端门禁（2026-09-12，源码 62665ae）通过：Android/model/plugin 共 817 项测试，零失败/错误/跳过；ABI、严格依赖校验、Maven 候选与独立消费、示例/benchmark 构建、文档和真实 V2/V3 Collector 联调均通过。候选记录 sourceDirty=false；本地证据不替代真机及生产验收。
 
 2026-09-07 可靠性修复：HTTP 支持活动请求取消，撤回结果通过 `uploadWorkerStopped` 报告退出证据；上传退避不会被新事件通知打断。V3 聚合保留发生身份与维度，统计值为数值类型。旧 outbox 缺失发生身份的行在内置 SQLite/V3 路径单独拒绝并计数，避免阻塞新事件。
 
@@ -12,10 +14,10 @@
 
 ## 当前基线
 
-- 同步日期：2026-09-12
+- 同步日期：2026-10-13
 - 27 个构建单元：25 个 root subproject + `apm-plugin`、`build-logic` 两个 included build
-- 169 个主源码文件：164 Kotlin + 4 C + 1 proto
-- 113 个测试/benchmark 文件
+- 170 个主源码文件：165 Kotlin + 4 C + 1 proto
+- 121 个测试/benchmark 文件
 
 - Kotlin 2.2.21 / AGP 8.13.2 / Gradle 8.13 / Java 17 toolchain（Gradle runtime JDK 17+）
 - compileSdk 34 / minSdk 24 / targetSdk 34 / Java 17 字节码

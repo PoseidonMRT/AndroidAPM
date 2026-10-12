@@ -1,6 +1,6 @@
 # Android APM 项目文档
 
-> 文档同步：2026-09-23｜27 个构建单元｜169 个主源码文件（164 Kotlin + 4 C + 1 proto）｜113 个测试/benchmark 文件
+> 文档同步：2026-10-13｜27 个构建单元｜170 个主源码文件（165 Kotlin + 4 C + 1 proto）｜121 个测试/benchmark 文件
 
 ## 一、项目结论
 
@@ -21,6 +21,10 @@ monitor module
 ```
 
 Crash/ANR 关键事件通过 `Apm.emitCriticalSync` 绕过共享队列、采样、聚合与限流，同步到 SQLite 或 critical IPC hand-off point；较低调用方 priority 自动提升为 CRITICAL，返回成功前不执行网络 IO。上传进程消费 CRITICAL IPC 时仍同步落 store，只有下游接受后删除 ready 文件；false、recoverable 存储失败或 consumer 未就绪会保留整文件重试，已发布 `.ipc` 不按年龄先行删除，只有未完成 `.tmp` 在 5 分钟后清理。每个事件拥有稳定 `eventId`，上传 Worker 原子 claim 后由 owner ACK/失败释放，租约过期可重领。上传成功后删除，失败保留并重试；这是 at-least-once，不是 exactly-once，网络响应不确定或整文件重试时服务端仍须按 `eventId` 去重。
+
+## 2026-10-13 深度审查
+
+2026-10-13 深度审查按 16 项问题推进修复：清理与新 init 的所有权、旧 ANR/Hprof/Launch 回调的会话隔离、WebView 宿主回调与后台线程约束、页面/资源/文件容量、HTTP 响应体与内存 retry 生命周期、签名配置 scope、完整 Header 脱敏、ART Hprof 流式布局、Native handler 重启以及 Launch 时钟。既有 wire/codec/SQLite schema 保持；ABI 仅手工追加两个 ApmContext synthetic 会话交接 overload。 逐项计划、实际验证与限制见 [本轮审查记录](REVIEW_2026_10_13.md)。
 
 ## 2026-09-23 对前一日修改的复核
 
@@ -100,8 +104,8 @@ JDK 17 定向验证通过 included plugin 1 suite / 23 tests、plugin `apiCheck`
 | root Gradle subproject | 25 |
 | included build | 2：`apm-plugin`、`build-logic` |
 | 总构建单元 | 27 |
-| 主源码 | 169：164 Kotlin + 4 C + 1 proto |
-| 测试/benchmark 文件 | 113 |
+| 主源码 | 170：165 Kotlin + 4 C + 1 proto |
+| 测试/benchmark 文件 | 121 |
 | Kotlin | 2.2.21 |
 | AGP | 8.13.2 |
 | Gradle | 8.13 |
