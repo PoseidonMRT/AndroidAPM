@@ -69,6 +69,8 @@ Apm.register(CrashModule(CrashConfig(), writeExitIdentitySummary = false))
 
 ## 测试
 
+Native monitor 在成功卸载 handler 后释放安装状态，模块 stop/start 可以重新安装；安装失败仍允许下一次尝试。内部 JNI adapter 的顺序回归证明 JVM 生命周期，不替代真实 ART/OEM signal 恢复。
+
 `CrashConfigTest`, `CrashCriticalHandoffTest`, `NativeCrashMonitorJniContractTest`, `ExitReasonCollectorTest` 覆盖配置、同步 hand-off 成功/false/recoverable/fatal 与原 handler 委托、JNI 名称/绑定和退出原因映射。`ExitOccurrenceSummaryTest` 覆盖 UTF-8/128 字节与损坏输入；`CrashExitHistoryTest` 通过真实模块/dispatcher 和 Robolectric 系统历史，覆盖旧 release/worker 身份、未知身份计数、显式 V2、摘要写入 opt-out、超限、撤回清理和阻塞 trace 的停止/重启。真实 signal/tombstone/symbolization 需真机验证。
 
 ## 时间语义

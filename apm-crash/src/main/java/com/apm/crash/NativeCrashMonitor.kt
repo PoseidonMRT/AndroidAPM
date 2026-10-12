@@ -23,13 +23,19 @@ import java.io.File
  */
 object NativeCrashMonitor {
 
-    /** 是否已初始化。 */
-    @Volatile
-    private var initialized = false
-
     /** 信号处理器是否已安装。 */
     @Volatile
     private var signalHandlerInstalled = false
+
+    /** Testable JNI boundary; replacing it never changes the public native method signatures. */
+    internal var signalRuntime: NativeCrashSignalRuntime = object : NativeCrashSignalRuntime {
+        /** Loads the packaged crash library before resolving the native entry points. */
+        override fun load() = System.loadLibrary("apm_crash")
+        /** Installs this session's signal handlers. */
+        override fun install(unsafeSignalCallback: Boolean): Boolean = nativeInstallSignalHandlers(unsafeSignalCallback)
+        /** Restores the handlers that preceded this session. */
+        override fun uninstall() = nativeUninstallSignalHandlers()
+    }
 
     /** 最近一次 tombstone 检查时间。 */
     private var lastCheckElapsedTime: Long = 0L
@@ -86,16 +92,16 @@ object NativeCrashMonitor {
      *
      * @param unsafeSignalCallback 是否允许在信号处理器内直接回调 Java；仅建议调试环境使用
      */
+    @Synchronized
     fun init(unsafeSignalCallback: Boolean = false) {
-        if (initialized) {
+        if (signalHandlerInstalled) {
             return
         }
-        initialized = true
         try {
             // 加载 JNI 库
-            System.loadLibrary("apm_crash")
+            signalRuntime.load()
             // 安装信号处理器：默认只恢复原 handler 并重抛，避免信号上下文执行 Java。
-            if (nativeInstallSignalHandlers(unsafeSignalCallback)) {
+            if (signalRuntime.install(unsafeSignalCallback)) {
                 signalHandlerInstalled = true
             }
         } catch (e: UnsatisfiedLinkError) {
@@ -107,11 +113,12 @@ object NativeCrashMonitor {
      * 销毁信号处理器，恢复原始信号处理。
      * 在模块卸载或进程退出前调用。
      */
+    @Synchronized
     fun destroy() {
         if (signalHandlerInstalled) {
             try {
                 // 恢复原始信号处理器
-                nativeUninstallSignalHandlers()
+                signalRuntime.uninstall()
             } catch (e: UnsatisfiedLinkError) {
                 // JNI 库已卸载，忽略
             }
@@ -291,4 +298,14 @@ object NativeCrashMonitor {
         SIGNAL_SIGTERM -> "SIGTERM"
         else -> "UNKNOWN($signal)"
     }
+}
+
+/** Internal JNI adapter for verifying actual start/stop/restart installation attempts on the JVM. */
+internal interface NativeCrashSignalRuntime {
+    /** Loads the library or throws the original linker failure. */
+    fun load()
+    /** Returns the native handler-installation outcome. */
+    fun install(unsafeSignalCallback: Boolean): Boolean
+    /** Restores the previously saved native handlers. */
+    fun uninstall()
 }
