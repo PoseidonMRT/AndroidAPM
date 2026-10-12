@@ -4,12 +4,11 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import com.apm.core.Apm
 import com.apm.core.ApmClock
+import com.apm.core.ApmContext
+import com.apm.model.ApmEvent
 import com.apm.model.ApmEventKind
 import com.apm.model.ApmSeverity
 import com.apm.model.ApmPriority
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * WebView 资源加载瀑布图追踪器。
@@ -32,19 +31,26 @@ import java.util.concurrent.CopyOnWriteArrayList
  * waterfall.onPageComplete(url)
  * ```
  */
-class ResourceWaterfall(private val config: WebviewConfig) {
+class ResourceWaterfall internal constructor(
+    /** Immutable tracking budget and detection thresholds. */
+    private val config: WebviewConfig,
+    /** Runtime captured by an owning module; standalone recorders retain their original global behavior. */
+    private val context: ApmContext?
+) {
+    /** Creates a standalone resource recorder with the published constructor signature. */
+    constructor(config: WebviewConfig) : this(config, null)
 
-    /**
-     * 当前页面的资源记录集合：pageUrl → 资源列表。
-     * 使用 ConcurrentHashMap 保证线程安全（资源加载可能在不同线程完成）。
-     */
-    private val pageResources = ConcurrentHashMap<String, CopyOnWriteArrayList<ResourceRecord>>()
+    /** Serializes bounded admission, completion, and shutdown across resource callback threads. */
+    private val stateLock = Any()
 
-    /**
-     * 资源开始加载时间缓存：resourceUrl → startTimeMs。
-     * 用于在 onResourceEnd 时计算加载耗时。
-     */
-    private val resourceStartTimes = ConcurrentHashMap<String, ConcurrentLinkedQueue<Long>>()
+    /** Admitted resources grouped by page; their records also own every pending start timestamp. */
+    private val pageResources = HashMap<String, MutableList<ResourceRecord>>()
+
+    /** Total retained records across all pages, including unfinished or abandoned navigations. */
+    private var trackedResourceCount = 0
+
+    /** Permanent stop gate for host references retained after the owning module stops. */
+    private var active = true
 
     /**
      * 当前活跃页面的 URL。
@@ -79,34 +85,22 @@ class ResourceWaterfall(private val config: WebviewConfig) {
             return
         }
 
-        val startedAt = ApmClock.monotonicTimeMillis()
-        resourceStartTimes.getOrPut(resourceKey(pageUrl, url)) {
-            ConcurrentLinkedQueue()
-        }.offer(startedAt)
-
-        // 推断资源类型
-        val resourceType = inferResourceType(url)
-
-        // 获取或创建当前页面的资源列表
-        val records = pageResources.getOrPut(pageUrl) {
-            // 限制最大追踪资源数，防止内存溢出
-            CopyOnWriteArrayList()
-        }
-
-        // 检查资源数量是否已达上限
-        if (records.size >= config.maxTrackedResources) {
-            return
-        }
-
-        // 添加资源记录
-        records.add(
-            ResourceRecord(
-                pageUrl = pageUrl,
-                url = url,
-                resourceType = resourceType,
-                startTimeMs = startedAt
+        synchronized(stateLock) {
+            if (!active || trackedResourceCount >= config.maxTrackedResources.coerceAtLeast(0)) {
+                // Rejected requests retain neither URL keys nor pending timestamps.
+                return
+            }
+            val records = pageResources.getOrPut(pageUrl) { ArrayList() }
+            records.add(
+                ResourceRecord(
+                    pageUrl = pageUrl,
+                    url = url,
+                    resourceType = inferResourceType(url),
+                    startTimeMs = ApmClock.monotonicTimeMillis()
+                )
             )
-        )
+            trackedResourceCount++
+        }
     }
 
     /**
@@ -127,24 +121,19 @@ class ResourceWaterfall(private val config: WebviewConfig) {
      * @param response optional response
      */
     fun onResourceEnd(pageUrl: String, url: String, response: WebResourceResponse?) {
-        // 查找并移除开始时间
         if (pageUrl.isEmpty()) {
             return
         }
-        val key = resourceKey(pageUrl, url)
-        val starts = resourceStartTimes[key] ?: return
-        val startTime = starts.poll() ?: return
-        if (starts.isEmpty()) {
-            resourceStartTimes.remove(key, starts)
-        }
-        val endTime = ApmClock.monotonicTimeMillis()
-        val duration = endTime - startTime
-
-        // 查找对应的资源记录并更新
-        val records = pageResources[pageUrl] ?: return
-        // 遍历查找匹配的资源记录
-        val record = records.firstOrNull { it.url == url && it.endTimeMs == 0L }
-        if (record != null) {
+        val slowEvent = synchronized(stateLock) {
+            if (!active) {
+                return
+            }
+            // One admitted record owns one start; duplicate URLs complete in admission order.
+            val record = pageResources[pageUrl]?.firstOrNull {
+                it.url == url && it.endTimeMs == 0L
+            } ?: return
+            val endTime = ApmClock.monotonicTimeMillis()
+            val duration = (endTime - record.startTimeMs).coerceAtLeast(0L)
             record.endTimeMs = endTime
             record.durationMs = duration
             // 提取 HTTP 状态码（响应不为空时）
@@ -153,24 +142,24 @@ class ResourceWaterfall(private val config: WebviewConfig) {
             }
             // 提取资源大小（从响应头获取）
             record.sizeBytes = extractContentLength(response)
-        }
-
-        // 慢资源实时告警
-        if (duration >= config.resourceSlowThresholdMs) {
-            Apm.emit(
-                module = MODULE_WEBVIEW,
-                name = EVENT_SLOW_RESOURCE,
-                kind = ApmEventKind.ALERT,
-                severity = ApmSeverity.WARN, priority = ApmPriority.LOW,
-                fields = mapOf(
-                    FIELD_URL to url.take(config.maxUrlLength),
-                    FIELD_PAGE_URL to pageUrl.take(config.maxUrlLength),
-                    FIELD_RESOURCE_TYPE to (record?.resourceType ?: RESOURCE_TYPE_OTHER),
-                    FIELD_DURATION_MS to duration,
-                    FIELD_THRESHOLD to config.resourceSlowThresholdMs
+            if (duration >= config.resourceSlowThresholdMs) {
+                ApmEvent(
+                    module = MODULE_WEBVIEW,
+                    name = EVENT_SLOW_RESOURCE,
+                    kind = ApmEventKind.ALERT,
+                    severity = ApmSeverity.WARN, priority = ApmPriority.LOW,
+                    fields = mapOf(
+                        FIELD_URL to url.take(config.maxUrlLength),
+                        FIELD_PAGE_URL to pageUrl.take(config.maxUrlLength),
+                        FIELD_RESOURCE_TYPE to record.resourceType,
+                        FIELD_DURATION_MS to duration,
+                        FIELD_THRESHOLD to config.resourceSlowThresholdMs
+                    )
                 )
-            )
+            } else null
         }
+        // Host context callbacks run outside the resource-state lock.
+        slowEvent?.let(::report)
     }
 
     /**
@@ -180,20 +169,23 @@ class ResourceWaterfall(private val config: WebviewConfig) {
      * @param url 页面 URL
      */
     fun onPageComplete(url: String) {
-        // 取出该页面的所有资源记录
-        val records = pageResources.remove(url) ?: return
-        val pageCompletedAt = ApmClock.monotonicTimeMillis()
-        for (record in records) {
-            if (record.endTimeMs == 0L) {
-                // Public WebView callbacks do not expose network completion for
-                // non-intercepted resources. Page completion is the supported,
-                // conservative upper bound for those entries.
-                record.endTimeMs = pageCompletedAt
-                record.durationMs = (pageCompletedAt - record.startTimeMs).coerceAtLeast(0L)
+        val records = synchronized(stateLock) {
+            if (!active) {
+                return
             }
+            // Removing the admitted records removes all pending timing state for this page atomically.
+            val completed = pageResources.remove(url) ?: return
+            trackedResourceCount -= completed.size
+            val pageCompletedAt = ApmClock.monotonicTimeMillis()
+            for (record in completed) {
+                if (record.endTimeMs == 0L) {
+                    // Public callbacks expose page completion as an upper bound, not exact resource completion.
+                    record.endTimeMs = pageCompletedAt
+                    record.durationMs = (pageCompletedAt - record.startTimeMs).coerceAtLeast(0L)
+                }
+            }
+            completed
         }
-        // 清理该页面相关的开始时间缓存
-        cleanupStartTimes(records)
 
         // 过滤出已完成加载的资源（有有效结束时间）
         val completedRecords = records.filter { it.endTimeMs > 0 }
@@ -207,8 +199,8 @@ class ResourceWaterfall(private val config: WebviewConfig) {
         }
 
         // 关键路径分析：识别阻塞渲染的资源（CSS 和同步 JS）
+        val earliestStart = completedRecords.minOf { record -> record.startTimeMs }
         val criticalPathResources = completedRecords.filter {
-            val earliestStart = completedRecords.minOf { record -> record.startTimeMs }
             it.resourceType == RESOURCE_TYPE_STYLESHEET ||
                 (it.resourceType == RESOURCE_TYPE_SCRIPT &&
                     it.startTimeMs - earliestStart <= CRITICAL_START_WINDOW_MS)
@@ -228,17 +220,19 @@ class ResourceWaterfall(private val config: WebviewConfig) {
         )
 
         // 上报瀑布图摘要事件
-        Apm.emit(
-            module = MODULE_WEBVIEW,
-            name = EVENT_RESOURCE_WATERFALL,
-            kind = ApmEventKind.METRIC,
-            severity = ApmSeverity.INFO, priority = ApmPriority.LOW,
-            fields = mapOf(
-                FIELD_PAGE_URL to url.take(config.maxUrlLength),
-                FIELD_TOTAL_COUNT to result.totalCount,
-                FIELD_SLOW_COUNT to slowResources.size,
-                FIELD_CRITICAL_COUNT to criticalPathResources.size,
-                FIELD_TOTAL_DURATION_MS to totalDurationMs
+        report(
+            ApmEvent(
+                module = MODULE_WEBVIEW,
+                name = EVENT_RESOURCE_WATERFALL,
+                kind = ApmEventKind.METRIC,
+                severity = ApmSeverity.INFO, priority = ApmPriority.LOW,
+                fields = mapOf(
+                    FIELD_PAGE_URL to url.take(config.maxUrlLength),
+                    FIELD_TOTAL_COUNT to result.totalCount,
+                    FIELD_SLOW_COUNT to slowResources.size,
+                    FIELD_CRITICAL_COUNT to criticalPathResources.size,
+                    FIELD_TOTAL_DURATION_MS to totalDurationMs
+                )
             )
         )
     }
@@ -250,30 +244,53 @@ class ResourceWaterfall(private val config: WebviewConfig) {
      * @param url 页面 URL
      */
     fun setActivePage(url: String) {
-        activePageUrl = url
-    }
-
-    /**
-     * 清理指定资源列表对应的开始时间缓存。
-     *
-     * @param records 需要清理的资源记录列表
-     */
-    private fun cleanupStartTimes(records: List<ResourceRecord>) {
-        // 遍历移除每个资源的开始时间缓存
-        records.forEach { record ->
-            resourceStartTimes.remove(resourceKey(record.pageUrl, record.url))
+        synchronized(stateLock) {
+            if (active) {
+                activePageUrl = url
+            }
         }
     }
 
-    /**
-     * Creates a collision-safe page/resource lookup key.
-     *
-     * @param pageUrl page URL
-     * @param resourceUrl resource URL
-     * @return composite key
-     */
-    private fun resourceKey(pageUrl: String, resourceUrl: String): String {
-        return "$pageUrl$RESOURCE_KEY_SEPARATOR$resourceUrl"
+    /** Permanently closes this recorder and clears admitted resources retained by incomplete pages. */
+    internal fun stop() {
+        synchronized(stateLock) {
+            active = false
+            activePageUrl = ""
+            pageResources.clear()
+            trackedResourceCount = 0
+        }
+    }
+
+    /** Releases an abandoned navigation without emitting a page-completion summary. */
+    internal fun discardPage(url: String) {
+        synchronized(stateLock) {
+            val discarded = pageResources.remove(url) ?: return
+            trackedResourceCount -= discarded.size
+            if (activePageUrl == url) activePageUrl = ""
+        }
+    }
+
+    /** Delivers an observation through its captured runtime without holding locks across host code. */
+    private fun report(event: ApmEvent) {
+        if (!synchronized(stateLock) { active }) {
+            return
+        }
+        val capturedContext = context
+        if (capturedContext != null) {
+            // Host callbacks finish before the permanent stop gate and final handoff share one lock.
+            capturedContext.emitInSession(event, critical = false) { handoff ->
+                synchronized(stateLock) { if (active) handoff() else false }
+            }
+        } else {
+            Apm.emit(
+                module = event.module,
+                name = event.name,
+                kind = event.kind,
+                severity = event.severity,
+                priority = event.priority,
+                fields = event.fields
+            )
+        }
     }
 
     /**
@@ -443,8 +460,6 @@ class ResourceWaterfall(private val config: WebviewConfig) {
         /** Scripts starting near navigation start are treated as critical. */
         private const val CRITICAL_START_WINDOW_MS = 1_000L
 
-        /** Composite resource key separator. */
-        private const val RESOURCE_KEY_SEPARATOR = "\u0000"
     }
 }
 

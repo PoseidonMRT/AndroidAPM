@@ -11,12 +11,13 @@ import com.apm.core.ApmExecutors
 import com.apm.core.ApmModule
 import com.apm.core.diagnostics.HostIntegrationPoint
 import com.apm.model.ApmEventKind
+import com.apm.model.ApmEvent
 import com.apm.model.ApmSeverity
 import com.apm.model.ApmPriority
 import java.util.WeakHashMap
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 /**
@@ -48,10 +49,17 @@ class WebviewModule(private val config: WebviewConfig = WebviewConfig()) : ApmMo
     @Volatile
     private var started = false
 
-    /** 页面加载开始时间记录：url → startTime。 */
-    private val pageLoadStartMap = HashMap<String, Long>()
+    /** Coordinates page generations, bounded admission, and permanent module-run cancellation. */
+    private val pageStateLock = Any()
+
+    /** Bounded navigation records; visible pages retain timing until completion or capacity eviction. */
+    private val pageLoadStartMap = LinkedHashMap<String, PageLoad>()
+
+    /** Current module run; replaced runs can never deliver a late timeout. */
+    private var pageSession: PageSession? = null
 
     /** 资源加载瀑布图追踪器，仅在配置启用时创建。 */
+    @Volatile
     private var resourceWaterfall: ResourceWaterfall? = null
 
     /** Explicit WebView installations retained weakly for reversible shutdown. */
@@ -60,25 +68,35 @@ class WebviewModule(private val config: WebviewConfig = WebviewConfig()) : ApmMo
     /** Scheduler for bounded page-visibility timeout checks. */
     private var visibilityScheduler: ScheduledExecutorService? = null
 
-    /** Pending page visibility checks keyed by URL. */
-    private val visibilityChecks = ConcurrentHashMap<String, VisibilityCheck>()
-
     override fun onInitialize(context: ApmContext) {
         apmContext = context
     }
 
     override fun onStart() {
-        started = config.enableWebviewMonitor
+        val previousScheduler = synchronized(pageStateLock) {
+            pageSession?.active = false
+            clearPagesLocked()
+            val previous = visibilityScheduler
+            started = config.enableWebviewMonitor
+            pageSession = if (started) PageSession(apmContext) else null
+            visibilityScheduler = if (started) {
+                ScheduledThreadPoolExecutor(VISIBILITY_THREAD_COUNT,
+                    ApmExecutors.threadFactory(VISIBILITY_THREAD_NAME)).apply {
+                    // Canceled navigations must release their URL/token closures immediately, too.
+                    removeOnCancelPolicy = true
+                }
+            } else null
+            previous
+        }
+        previousScheduler?.shutdownNow()
         @Suppress("DEPRECATION")
         if (config.enableAutoRegister) {
             apmContext?.logger?.w("enableAutoRegister is deprecated and ignored; call install for each WebView")
         }
         // 仅在启用时创建资源瀑布图追踪器
         if (config.enableResourceWaterfall) {
-            resourceWaterfall = ResourceWaterfall(config)
-        }
-        if (started) {
-            visibilityScheduler = ApmExecutors.newSingleThreadScheduledExecutor(VISIBILITY_THREAD_NAME)
+            resourceWaterfall?.stop()
+            resourceWaterfall = ResourceWaterfall(config, apmContext)
         }
         apmContext?.setHostIntegrationModuleActive(HostIntegrationPoint.WEBVIEW, started)
         if (started) {
@@ -91,19 +109,22 @@ class WebviewModule(private val config: WebviewConfig = WebviewConfig()) : ApmMo
     }
 
     override fun onStop() {
-        started = false
+        val scheduler = synchronized(pageStateLock) {
+            started = false
+            pageSession?.active = false
+            pageSession = null
+            clearPagesLocked()
+            visibilityScheduler.also { visibilityScheduler = null }
+        }
         apmContext?.setHostIntegrationModuleActive(HostIntegrationPoint.WEBVIEW, false)
-        pageLoadStartMap.clear()
-        visibilityChecks.values.forEach { check -> check.future?.cancel(false) }
-        visibilityChecks.clear()
-        visibilityScheduler?.shutdownNow()
-        visibilityScheduler = null
+        scheduler?.shutdownNow()
         val installedViews = synchronized(installations) { installations.keys.toList() }
         for (webView in installedViews) {
             // Restore host clients before releasing installation metadata.
             uninstall(webView)
         }
         // 释放瀑布图追踪器
+        resourceWaterfall?.stop()
         resourceWaterfall = null
     }
 
@@ -181,15 +202,28 @@ class WebviewModule(private val config: WebviewConfig = WebviewConfig()) : ApmMo
      * 记录开始时间，用于计算加载耗时。
      */
     fun onPageStarted(url: String) {
-        if (!started) {
-            return
+        synchronized(pageStateLock) {
+            val session = pageSession?.takeIf { it.active } ?: return
+            val scheduler = visibilityScheduler ?: return
+            pageLoadStartMap.remove(url)?.future?.cancel(false)
+            if (pageLoadStartMap.size >= MAX_TRACKED_PAGES) {
+                val oldest = pageLoadStartMap.entries.iterator()
+                val evicted = oldest.next()
+                evicted.value.future?.cancel(false)
+                oldest.remove()
+            }
+            val page = PageLoad(ApmClock.monotonicTimeMillis(), session)
+            pageLoadStartMap[url] = page
+            // Publish the token before scheduling; the same lock prevents stop from shutting down midway.
+            page.future = scheduler.schedule(
+                { onVisibilityTimeout(url, page) },
+                config.whiteScreenThresholdMs.coerceAtLeast(MIN_VISIBILITY_TIMEOUT_MS),
+                TimeUnit.MILLISECONDS
+            )
         }
         recordIntegrationObservation()
-        // 记录页面加载起始时间
-        pageLoadStartMap[url] = ApmClock.monotonicTimeMillis()
         // 通知瀑布图追踪器当前活跃页面
         resourceWaterfall?.setActivePage(url)
-        scheduleVisibilityTimeout(url)
     }
 
     /**
@@ -198,19 +232,19 @@ class WebviewModule(private val config: WebviewConfig = WebviewConfig()) : ApmMo
      * 同时触发资源瀑布图完成回调。
      */
     fun onPageFinished(url: String) {
-        if (!started) {
-            return
+        val waterfall = resourceWaterfall
+        val page = synchronized(pageStateLock) {
+            if (!started) return
+            pageLoadStartMap.remove(url)?.also { it.future?.cancel(false) }
         }
         recordIntegrationObservation()
-        val startTime = pageLoadStartMap.remove(url)
-        cancelVisibilityTimeout(url)
-        if (startTime != null) {
-            val duration = ApmClock.elapsedMillisSince(startTime)
+        if (page != null) {
+            val duration = ApmClock.elapsedMillisSince(page.startedAtMillis)
 
             // 超过页面加载阈值时上报慢加载事件
             if (duration >= config.pageLoadThresholdMs) {
-                Apm.emit(
-                    module = MODULE_NAME,
+                emitForPageSession(
+                    session = page.session,
                     name = EVENT_SLOW_PAGE_LOAD,
                     kind = ApmEventKind.ALERT,
                     severity = ApmSeverity.WARN, priority = ApmPriority.LOW,
@@ -224,16 +258,27 @@ class WebviewModule(private val config: WebviewConfig = WebviewConfig()) : ApmMo
         }
 
         // 触发瀑布图完成，输出资源加载统计数据
-        resourceWaterfall?.onPageComplete(url)
+        waterfall?.onPageComplete(url)
     }
 
     /** Marks a page as visually committed and cancels its timeout alarm. */
     fun onPageVisible(url: String) {
-        if (!started) {
-            return
+        synchronized(pageStateLock) {
+            if (!started) return
+            pageLoadStartMap[url]?.let { page ->
+                page.future?.cancel(false)
+                page.future = null
+            }
         }
         recordIntegrationObservation()
-        cancelVisibilityTimeout(url)
+    }
+
+    /** Discards a superseded navigation without reporting it as a completed page. */
+    internal fun onNavigationReplaced(url: String) {
+        synchronized(pageStateLock) {
+            pageLoadStartMap.remove(url)?.future?.cancel(false)
+        }
+        resourceWaterfall?.discardPage(url)
     }
 
     /**
@@ -408,35 +453,72 @@ class WebviewModule(private val config: WebviewConfig = WebviewConfig()) : ApmMo
         return waterfall
     }
 
-    /** Schedules one suspected-white-screen timeout for a started page. */
-    private fun scheduleVisibilityTimeout(url: String) {
-        cancelVisibilityTimeout(url)
-        val scheduler = visibilityScheduler ?: return
-        val check = VisibilityCheck()
-        visibilityChecks[url] = check
-        check.future = scheduler.schedule(
-            {
-                // Remove only the still-current task; replaced navigations must
-                // not emit stale white-screen events.
-                if (visibilityChecks.remove(url, check) && started) {
-                    onWhiteScreen(url, config.whiteScreenThresholdMs)
-                }
-            },
-            config.whiteScreenThresholdMs.coerceAtLeast(MIN_VISIBILITY_TIMEOUT_MS),
-            TimeUnit.MILLISECONDS
+    /** Removes all timing state only when the scheduled task still owns this navigation generation. */
+    private fun onVisibilityTimeout(url: String, page: PageLoad) {
+        synchronized(pageStateLock) {
+            if (!page.session.active || pageSession !== page.session || pageLoadStartMap[url] !== page ||
+                page.future == null) return
+            pageLoadStartMap.remove(url)
+            page.future = null
+        }
+        recordIntegrationObservation()
+        emitForPageSession(
+            session = page.session,
+            name = EVENT_WHITE_SCREEN,
+            kind = ApmEventKind.ALERT,
+            severity = ApmSeverity.ERROR,
+            priority = ApmPriority.LOW,
+            fields = mapOf(
+                FIELD_URL to url.take(config.maxUrlLength),
+                FIELD_DURATION_MS to config.whiteScreenThresholdMs
+            )
         )
     }
 
-    /** Cancels one pending page visibility timeout. */
-    private fun cancelVisibilityTimeout(url: String) {
-        visibilityChecks.remove(url)?.future?.cancel(false)
+    /** Cancels and clears bounded navigation records while holding [pageStateLock]. */
+    private fun clearPagesLocked() {
+        pageLoadStartMap.values.forEach { it.future?.cancel(false) }
+        pageLoadStartMap.clear()
     }
 
-    /** Mutable future holder inserted before scheduling to close fast-timeout races. */
-    private class VisibilityCheck {
+    /** Delivers a page observation only to the runtime and permanent module run which produced it. */
+    private fun emitForPageSession(
+        session: PageSession,
+        name: String,
+        kind: ApmEventKind,
+        severity: ApmSeverity,
+        priority: ApmPriority,
+        fields: Map<String, Any?>
+    ) {
+        val event = ApmEvent(module = MODULE_NAME, name = name, kind = kind,
+            severity = severity, priority = priority, fields = fields)
+        val context = session.context ?: return
+        // Business context is captured outside our lock; final admission rechecks the original run.
+        context.emitInSession(event, critical = false) { handoff ->
+            synchronized(pageStateLock) {
+                if (session.active && pageSession === session) handoff() else false
+            }
+        }
+    }
+
+    /** One navigation generation with a bounded lifetime and its owning module run. */
+    private class PageLoad(
+        /** Monotonic navigation start for the slow-page measurement. */
+        val startedAtMillis: Long,
+        /** Permanent module-run identity used by the timeout and completion paths. */
+        val session: PageSession
+    ) {
         /** Scheduled timeout once the scheduler accepts it. */
-        @Volatile
         var future: ScheduledFuture<*>? = null
+    }
+
+    /** Immutable runtime ownership with a gate which is never reopened after stop. */
+    private class PageSession(
+        /** Runtime captured at module start. */
+        val context: ApmContext?
+    ) {
+        /** Guarded by [pageStateLock]; old timeout callbacks remain permanently canceled. */
+        var active = true
     }
 
     /** Clients associated with one explicit WebView installation. */
@@ -510,8 +592,12 @@ class WebviewModule(private val config: WebviewConfig = WebviewConfig()) : ApmMo
         private const val MAX_ERROR_MESSAGE_LENGTH = 500
         /** Background thread used only for page-visibility deadlines. */
         private const val VISIBILITY_THREAD_NAME = "apm-webview-visibility"
+        /** Visibility tasks are serialized on one daemon worker. */
+        private const val VISIBILITY_THREAD_COUNT = 1
         /** Lower bound preventing a hot-loop timeout configuration. */
         private const val MIN_VISIBILITY_TIMEOUT_MS = 1L
+        /** Maximum simultaneous unfinished or visible navigation records across direct callbacks. */
+        private const val MAX_TRACKED_PAGES = 128
         /** Nanoseconds contained in one millisecond. */
         private const val NANOS_PER_MILLISECOND = 1_000_000L
     }

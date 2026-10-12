@@ -1,6 +1,6 @@
 # apm-webview 模块
 
-> 同步日期：2026-07-11｜模块名：`webview`
+> 同步日期：2026-10-13｜模块名：`webview`
 
 ## 目的与接入
 
@@ -23,7 +23,7 @@ Android 没有进程级 WebView 注册表。`WebviewModule` 对宿主明确指�
 
 ## ResourceWaterfall
 
-`getResourceWaterfall()` 返回资源记录器：支持 page isolation、重复 URL、并发资源、慢资源事件、关键路径和 waterfall 汇总。wrapper 在 `shouldInterceptRequest` 记录开始；公共 API 无法获得普通网络资源的精确完成回调，因此页面完成作为保守上界。tracking map 受 `maxTrackedResources=200` 约束。
+`getResourceWaterfall()` 返回资源记录器：支持 page isolation、重复 URL、并发资源、慢资源事件、关键路径和 waterfall 汇总。wrapper 在 `shouldInterceptRequest` 记录开始；公共 API 无法获得普通网络资源的精确完成回调，因此页面完成作为保守上界。`maxTrackedResources=200` 是全部页面共享的准入上限，计时与记录在同一短锁内创建；重复 URL 按 FIFO 完成，页面结束清除其全部记录，停止永久关闭旧 recorder。
 
 事件：`slow_page_load`, `slow_js_execution`, `white_screen`, `slow_js_bridge`, `js_console_error`, `slow_resource`, `resource_waterfall`。
 
@@ -43,7 +43,9 @@ Android 没有进程级 WebView 注册表。`WebviewModule` 对宿主明确指�
 
 ## 线程与隐私
 
-导航/chrome callback 运行在宿主调用线程；白屏 deadline 使用 `ApmExecutors` 单线程 scheduler，停止时取消。URL、JS snippet、console error 和 bridge 字段都可能包含隐私，生产必须截断/脱敏。
+导航/chrome callback 运行在宿主调用线程；后台资源拦截只使用按 WebView 弱身份保存的页面快照，不读取 `WebView.url`。同一个 wrapper 可复用到不同实例而不串导航快照；完成回调在可能阻塞的报告之前关闭资源准入。SDK 观察失败不阻止原 delegate，renderer exit / Safe Browsing / Chrome 回调保持宿主原参数和返回值。
+
+页面计时最多保留 128 个活跃导航，替换、超时、完成和停止都会取消或移除对应 token；visible 页面取消白屏 alarm，但加载计时仍受容量上限约束。单线程 scheduler 开启 `removeOnCancelPolicy`，取消的延时闭包不继续积压。timeout/slow-page 报告绑定捕获 runtime 和永久模块会话，在宿主业务上下文返回后再检查门禁。URL、JS snippet、console error 和 bridge 字段都可能包含隐私，生产必须截断/脱敏。
 
 ## 边界
 

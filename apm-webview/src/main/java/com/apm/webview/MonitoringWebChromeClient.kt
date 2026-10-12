@@ -13,6 +13,7 @@ import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebStorage
 import android.webkit.WebView
+import com.apm.core.Apm
 
 /** Delegating WebChromeClient that observes console failures without replacing host behavior. */
 @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
@@ -25,12 +26,17 @@ internal class MonitoringWebChromeClient(
     /** Records JavaScript console errors and preserves the host decision. */
     override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {
         if (consoleMessage.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
-            module.onJsConsoleError(
-                url = consoleMessage.sourceId().orEmpty(),
-                errorMessage = consoleMessage.message().orEmpty(),
-                sourceUrl = consoleMessage.sourceId(),
-                line = consoleMessage.lineNumber()
-            )
+            try {
+                module.onJsConsoleError(
+                    url = consoleMessage.sourceId().orEmpty(),
+                    errorMessage = consoleMessage.message().orEmpty(),
+                    sourceUrl = consoleMessage.sourceId(),
+                    line = consoleMessage.lineNumber()
+                )
+            } catch (error: Exception) {
+                // Console observation must not replace the host's handling decision.
+                Apm.recordInternalError(ERROR_CALLBACK, error)
+            }
         }
         return delegate.onConsoleMessage(consoleMessage)
     }
@@ -141,4 +147,9 @@ internal class MonitoringWebChromeClient(
         totalQuota,
         quotaUpdater
     )
+
+    companion object {
+        /** Payload-free tag for failed JavaScript console observation. */
+        private const val ERROR_CALLBACK = "webview_chrome_callback"
+    }
 }
