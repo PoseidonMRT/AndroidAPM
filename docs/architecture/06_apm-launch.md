@@ -1,6 +1,6 @@
 # apm-launch 模块
 
-> 同步日期：2026-07-10｜模块名：`launch`
+> 同步日期：2026-10-13｜模块名：`launch`
 
 ## 目的与入口
 
@@ -39,12 +39,12 @@
 
 ## 线程与资源
 
-主要生命周期状态在主线程更新；首帧 listener 使用 ViewTreeObserver/Choreographer。事件仍异步进入 core dispatcher。
+主要生命周期状态在主线程更新；首帧观察使用一次 Choreographer FrameCallback，注册失败时走主 Handler 回退。模块停止会取消已注册的 callback，并永久关闭该次模块会话；已经取出的迟到 callback 也不能进入重新启动的模块或 runtime。事件通过捕获的 `ApmContext.emitInSession` 异步进入 core dispatcher，宿主业务上下文返回后再校验最终会话门禁。
 
 ## 边界
 
 - SDK 无法无侵入捕获所有自定义 ContentProvider/Application 子阶段，需宿主调用。
-- 首帧是应用层可见帧近似，不等同于系统 Perfetto/FrameTimeline 全链。
+- `first_frame_rendered` 保留既有事件名，实际观测是注册后的下一次 VSync callback；该回调发生在绘制前，不证明屏幕已经呈现首帧。Handler 回退也只表示调度完成。精确首帧仍需系统 Perfetto/FrameTimeline 或宏基准。
 - 多 Activity/透明 Activity/特殊 task 模式需要真机场景验证。
 - 冷启动瓶颈分类由已有阶段数据推断。
 
@@ -54,4 +54,4 @@ Config、LaunchModule 和 RelaunchTracker 覆盖冷/热/温计算和状态转换
 
 ## 时间语义
 
-启动阶段 duration 统一使用 `ApmClock` 单调时间；上报 timestamp 保持 epoch。冷/热/温状态转换不再依赖可跳变的系统墙钟计算耗时。
+LaunchModule 的阶段起止统一使用 `SystemClock.elapsedRealtime()`，与 `Process.getStartElapsedRealtime()` 同基准且都包含 deep sleep，避免和 `nanoTime`/uptime 混用产生设备开机后的累计偏移。模块也向 RelaunchTracker 显式传入同一时基；独立使用该 tracker 时默认仍为 `ApmClock` 单调时间。上报 timestamp 保持 epoch。回归故意分离 elapsed/uptime 并校验各阶段的精确区间。

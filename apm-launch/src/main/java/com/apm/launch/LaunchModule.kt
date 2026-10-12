@@ -5,11 +5,13 @@ import android.app.Application
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import com.apm.core.Apm
+import android.os.SystemClock
+import android.view.Choreographer
 import com.apm.core.ApmClock
 import com.apm.core.ApmContext
 import com.apm.core.ApmModule
 import com.apm.model.ApmEventKind
+import com.apm.model.ApmEvent
 import com.apm.model.ApmSeverity
 import com.apm.model.ApmPriority
 
@@ -29,7 +31,8 @@ import com.apm.model.ApmPriority
  * - **热启动**：所有 Activity stop 后短时间恢复（Activity 仍在内存）
  * - **温启动**：所有 Activity stop 后长时间恢复（Activity 被回收，进程仍在）
  *
- * Uses the shared monotonic SDK clock so launch durations ignore wall-clock adjustments.
+ * Uses Android elapsedRealtime throughout so the kernel process-start baseline and every phase
+ * share one monotonic clock, including device deep sleep.
  */
 class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModule, Application.ActivityLifecycleCallbacks {
 
@@ -40,6 +43,13 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
 
     /** 主线程 Handler，用于首帧渲染回调。 */
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** Serializes session invalidation with callback registration and final event handoff. */
+    private val sessionLock = Any()
+
+    /** Current module run; stopped runs remain permanently closed even if this instance restarts. */
+    @Volatile
+    private var currentSession: LaunchSession? = null
 
     // --- 冷启动时间戳 ---
     /**
@@ -98,7 +108,7 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
             android.os.Process.getStartElapsedRealtime()
         } catch (e: Exception) {
             // 防御性回退：以模块初始化时间近似 attachBaseContext
-            ApmClock.monotonicTimeMillis()
+            SystemClock.elapsedRealtime()
         }
     }
 
@@ -106,7 +116,12 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
      * 注册 Activity 生命周期回调，启动监控。
      */
     override fun onStart() {
-        apmContext?.application?.registerActivityLifecycleCallbacks(this)
+        synchronized(sessionLock) {
+            // A fresh token cannot reactivate first-frame work captured by an earlier run.
+            currentSession?.active = false
+            currentSession = LaunchSession(apmContext)
+            apmContext?.application?.registerActivityLifecycleCallbacks(this)
+        }
         apmContext?.logger?.d("Launch module started, processStartMs=$processStartMs")
     }
 
@@ -114,7 +129,19 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
      * 注销回调，清理资源。
      */
     override fun onStop() {
-        apmContext?.application?.unregisterActivityLifecycleCallbacks(this)
+        val stoppedSession = synchronized(sessionLock) {
+            val session = currentSession
+            session?.active = false
+            currentSession = null
+            session
+        }
+        val callback = stoppedSession?.frameCallback
+        if (callback != null) {
+            // Choreographer callbacks are independent of mainHandler's message queue.
+            stoppedSession.choreographer?.removeFrameCallback(callback)
+            stoppedSession.frameCallback = null
+        }
+        stoppedSession?.context?.application?.unregisterActivityLifecycleCallbacks(this)
         mainHandler.removeCallbacksAndMessages(null)
     }
 
@@ -131,7 +158,7 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
             return
         }
         // 记录开始时间到 ThreadLocal 避免并发问题
-        providerStartTimes[providerName] = ApmClock.monotonicTimeMillis()
+        providerStartTimes[providerName] = SystemClock.elapsedRealtime()
     }
 
     /**
@@ -144,7 +171,7 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
             return
         }
         val startTime = providerStartTimes.remove(providerName) ?: return
-        val duration = ApmClock.elapsedMillisSince(startTime)
+        val duration = (SystemClock.elapsedRealtime() - startTime).coerceAtLeast(0L)
         contentProviderTotalMs += duration
         contentProviderCount++
     }
@@ -157,7 +184,7 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
         if (!config.enablePhaseTracking) {
             return
         }
-        appOnCreateStartMs = ApmClock.monotonicTimeMillis()
+        appOnCreateStartMs = SystemClock.elapsedRealtime()
     }
 
     /**
@@ -168,7 +195,7 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
         if (!config.enablePhaseTracking) {
             return
         }
-        appOnCreateEndMs = ApmClock.monotonicTimeMillis()
+        appOnCreateEndMs = SystemClock.elapsedRealtime()
     }
 
     // --- ActivityLifecycleCallbacks ---
@@ -178,13 +205,14 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
      * 只执行一次，触发首帧渲染监听。
      */
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
+        val session = activeSession() ?: return
         if (firstActivityCreated) {
             return
         }
 
         if (config.enablePhaseTracking) {
             // 记录 Phase 4: firstActivity.onCreate 开始
-            firstActivityOnCreateMs = ApmClock.monotonicTimeMillis()
+            firstActivityOnCreateMs = SystemClock.elapsedRealtime()
         }
 
         if (!config.enableColdStart) {
@@ -192,7 +220,7 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
         }
         firstActivityCreated = true
 
-        val now = ApmClock.monotonicTimeMillis()
+        val now = SystemClock.elapsedRealtime()
         val coldStartMs = now - processStartMs
 
         // 超时阈值内的才算有效冷启动
@@ -228,8 +256,8 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
             fields[FIELD_PHASE_ACTIVITY_CREATE_MS] = now - (if (appOnCreateEndMs > 0L) appOnCreateEndMs else processStartMs)
         }
 
-        Apm.emit(
-            module = MODULE_NAME,
+        emitForSession(
+            session = session,
             name = EVENT_COLD_START,
             kind = ApmEventKind.METRIC,
             severity = severity, priority = ApmPriority.HIGH,
@@ -238,7 +266,7 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
 
         // 注册首帧渲染监听
         if (config.enableFirstFrameTracking) {
-            registerFirstFrameListener(activity)
+            registerFirstFrameListener(session)
         }
     }
 
@@ -247,13 +275,14 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
      * 对首帧渲染追踪至关重要。
      */
     override fun onActivityResumed(activity: Activity) {
+        val session = activeSession() ?: return
         if (firstActivityCreated && firstActivityOnResumeMs <= 0L && config.enablePhaseTracking) {
             // 记录 Phase 5: firstActivity.onResume
-            firstActivityOnResumeMs = ApmClock.monotonicTimeMillis()
+            firstActivityOnResumeMs = SystemClock.elapsedRealtime()
         }
 
         // 热/温启动的恢复耗时以 resumed 结束，避免把后台停留时间当成启动耗时。
-        reportRelaunchIfNeeded(activity)
+        reportRelaunchIfNeeded(activity, session)
     }
 
     /**
@@ -261,8 +290,11 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
      * 热启动条件：之前所有 Activity 都已 stop，且这是第一个重新启动的。
      */
     override fun onActivityStarted(activity: Activity) {
+        if (activeSession() == null) {
+            return
+        }
         startedActivityCount++
-        val now = ApmClock.monotonicTimeMillis()
+        val now = SystemClock.elapsedRealtime()
         relaunchTracker.onActivityStarted(now)
 
         // 热启动/温启动判定：之前处于 stopped 状态，且这是第一个重新 start 的。
@@ -276,11 +308,14 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
      * 所有 Activity 都 stop 后记录时间点，为热启动计算做准备。
      */
     override fun onActivityStopped(activity: Activity) {
+        if (activeSession() == null) {
+            return
+        }
         startedActivityCount--
         if (startedActivityCount <= 0) {
             startedActivityCount = 0
             isStopped = true
-            activityStoppedTime = ApmClock.monotonicTimeMillis()
+            activityStoppedTime = SystemClock.elapsedRealtime()
             relaunchTracker.onAllActivitiesStopped(activityStoppedTime)
         }
     }
@@ -290,8 +325,8 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
      *
      * @param activity 当前恢复到前台的 Activity
      */
-    private fun reportRelaunchIfNeeded(activity: Activity) {
-        val measurement = relaunchTracker.onActivityResumed(ApmClock.monotonicTimeMillis()) ?: return
+    private fun reportRelaunchIfNeeded(activity: Activity, session: LaunchSession) {
+        val measurement = relaunchTracker.onActivityResumed(SystemClock.elapsedRealtime()) ?: return
         val eventName = when (measurement.launchType) {
             RelaunchTracker.LAUNCH_TYPE_HOT -> {
                 if (!config.enableHotStart) {
@@ -310,8 +345,8 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
             else -> return
         }
 
-        Apm.emit(
-            module = MODULE_NAME,
+        emitForSession(
+            session = session,
             name = eventName,
             kind = ApmEventKind.METRIC,
             severity = ApmSeverity.INFO, priority = ApmPriority.HIGH,
@@ -330,48 +365,57 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
 
     /**
      * 注册首帧渲染监听。
-     * 使用 Choreographer.FrameCallback 检测下一个 VSync 帧渲染完成。
+     * 使用 Choreographer.FrameCallback 近似记录下一次 VSync 回调；它发生在 draw 之前，
+     * 不能证明首帧已经提交或呈现。
      * 兼容所有 API 级别（API 16+）。
      */
-    private fun registerFirstFrameListener(activity: Activity) {
-        try {
-            // 使用 Choreographer 监听下一帧渲染
-            android.view.Choreographer.getInstance().postFrameCallback(object :
-                android.view.Choreographer.FrameCallback {
-                override fun doFrame(frameTimeNanos: Long) {
-                    if (firstFrameRendered) {
-                        return
-                    }
-                    firstFrameRendered = true
-                    firstFrameRenderedMs = ApmClock.monotonicTimeMillis()
-                    reportFirstFrame()
-                }
-            })
-        } catch (e: Exception) {
-            // Choreographer 不可用时降级为 Handler post
-            fallbackFirstFrameDetection()
+    private fun registerFirstFrameListener(session: LaunchSession) {
+        synchronized(sessionLock) {
+            if (!session.active || currentSession !== session) {
+                return
+            }
+            try {
+                // Keep the actual Choreographer and callback so stop can remove this scheduled work.
+                val choreographer = Choreographer.getInstance()
+                val callback = Choreographer.FrameCallback { completeFirstFrame(session) }
+                session.choreographer = choreographer
+                session.frameCallback = callback
+                choreographer.postFrameCallback(callback)
+            } catch (e: Exception) {
+                // Choreographer unavailable: the same captured token protects Handler fallback work.
+                session.frameCallback = null
+                session.choreographer = null
+                fallbackFirstFrameDetection(session)
+            }
         }
     }
 
     /**
      * 降级首帧检测方案。
-     * 通过 Handler.post 在下一个 VSync 后检测。
+     * 通过 Handler.post 近似记录下一次主线程调度；它同样不能证明首帧呈现。
      */
-    private fun fallbackFirstFrameDetection() {
-        mainHandler.post {
-            if (!firstFrameRendered) {
-                firstFrameRendered = true
-                firstFrameRenderedMs = ApmClock.monotonicTimeMillis()
-                reportFirstFrame()
+    private fun fallbackFirstFrameDetection(session: LaunchSession) {
+        mainHandler.post { completeFirstFrame(session) }
+    }
+
+    /** Accepts first-frame work only for the still-active run that originally scheduled it. */
+    private fun completeFirstFrame(session: LaunchSession) {
+        synchronized(sessionLock) {
+            if (!session.active || currentSession !== session || firstFrameRendered) {
+                return
             }
+            session.frameCallback = null
+            firstFrameRendered = true
+            firstFrameRenderedMs = SystemClock.elapsedRealtime()
         }
+        reportFirstFrame(session)
     }
 
     /**
      * 上报首帧渲染事件。
      * 包含完整的冷启动分阶段耗时。
      */
-    private fun reportFirstFrame() {
+    private fun reportFirstFrame(session: LaunchSession) {
         val totalColdStartMs = firstFrameRenderedMs - processStartMs
         val fields = mutableMapOf<String, Any>(
             FIELD_LAUNCH_DURATION_MS to totalColdStartMs,
@@ -412,8 +456,8 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
             else -> ApmSeverity.INFO
         }
 
-        Apm.emit(
-            module = MODULE_NAME,
+        emitForSession(
+            session = session,
             name = EVENT_FIRST_FRAME,
             kind = ApmEventKind.METRIC,
             severity = severity, priority = ApmPriority.HIGH,
@@ -422,7 +466,7 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
 
         // 上报启动瓶颈分析
         if (config.enablePhaseTracking) {
-            reportLaunchBottleneck(fields)
+            reportLaunchBottleneck(fields, session)
         }
     }
 
@@ -430,7 +474,7 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
      * 分析启动瓶颈阶段。
      * 找出耗时最长的阶段并上报。
      */
-    private fun reportLaunchBottleneck(fields: Map<String, Any>) {
+    private fun reportLaunchBottleneck(fields: Map<String, Any>, session: LaunchSession) {
         // 收集各阶段耗时
         val phases = mutableMapOf<String, Long>()
         (fields[FIELD_PHASE_APP_CREATE_MS] as? Number)?.toLong()?.let {
@@ -456,8 +500,8 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
         // 瓶颈阶段占比超过 40% 才上报
         val ratio = bottleneck.value.toDouble() / totalDuration.toDouble()
         if (ratio >= BOTTLENECK_REPORT_RATIO) {
-            Apm.emit(
-                module = MODULE_NAME,
+            emitForSession(
+                session = session,
                 name = EVENT_LAUNCH_BOTTLENECK,
                 kind = ApmEventKind.ALERT,
                 severity = ApmSeverity.WARN, priority = ApmPriority.HIGH,
@@ -469,6 +513,59 @@ class LaunchModule(private val config: LaunchConfig = LaunchConfig()) : ApmModul
                 )
             )
         }
+    }
+
+    /** Returns the live run without exposing tokens to host callers. */
+    private fun activeSession(): LaunchSession? = synchronized(sessionLock) {
+        currentSession?.takeIf { it.active }
+    }
+
+    /** Preserves default/business context while binding delayed reports to their original runtime. */
+    private fun emitForSession(
+        session: LaunchSession,
+        name: String,
+        kind: ApmEventKind,
+        severity: ApmSeverity,
+        priority: ApmPriority,
+        fields: Map<String, Any?>
+    ) {
+        if (!session.active) {
+            return
+        }
+        val context = session.context ?: return
+        val event = ApmEvent(
+            module = MODULE_NAME,
+            name = name,
+            kind = kind,
+            severity = severity,
+            priority = priority,
+            timestamp = ApmClock.wallTimeMillis(),
+            processName = context.processName,
+            fields = fields
+        )
+        // Host business-context callbacks run before acquiring the module gate for final handoff.
+        context.emitInSession(event, critical = false) { handoff ->
+            synchronized(sessionLock) {
+                if (session.active && currentSession === session) handoff() else false
+            }
+        }
+    }
+
+    /** One module run, with callback handles retained independently of any later initialization. */
+    private class LaunchSession(
+        /** Runtime captured at start, never replaced by a later onInitialize. */
+        val context: ApmContext?
+    ) {
+        /** Permanently false after stop or replacement. */
+        @Volatile
+        var active = true
+
+        /** Choreographer that owns the scheduled first-frame callback. */
+        var choreographer: Choreographer? = null
+
+        /** Actual first-frame callback cancelled during stop. */
+        @Volatile
+        var frameCallback: Choreographer.FrameCallback? = null
     }
 
     // --- 空实现的回调 ---
