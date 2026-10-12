@@ -48,7 +48,7 @@ class SignedRemoteConfigProvider internal constructor(
         headerProvider: HttpHeaderProvider,
         logger: RemoteConfigLogger = RemoteConfigLogger.APM
     ) : this(
-        store = SharedPreferencesRemoteConfigStore(context),
+        store = SharedPreferencesRemoteConfigStore(context, config, publicKeysBase64),
         verifier = TinkEd25519SignatureVerifier(publicKeysBase64),
         transport = HttpRemoteConfigTransport(config, headerProvider, AndroidRemoteConfigClock),
         clock = AndroidRemoteConfigClock,

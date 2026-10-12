@@ -1,6 +1,6 @@
 # apm-remote-config 模块架构
 
-> 同步日期：2026-07-16
+> 同步日期：2026-10-13
 
 ## 1. 职责与依赖
 
@@ -80,6 +80,8 @@ expiry / 204 / invalid response
 ```
 
 同 revision 不同有效签名被视为 publisher equivocation，因为服务端 revision 是不可变记录。缓存写失败时不发布内存状态，避免重启后回退到旧 revision。网络失败不延长 expiry；304 才会用响应 Date 更新锚点。
+
+LKG、ETag、可信时间与最高 revision 按 endpoint、appId、environment、installationId 及 APK 固定公钥集合共同隔离。scope 使用长度前缀编码并 SHA-256 命名，公钥按 keyId 排序以保持顺序无关；更换服务端/环境/安装身份/信任根不会继承旧 kill switch 或 rollback floor。历史无 scope preferences 不迁移，首次启动重新拉取；Bearer Token 轮换不改变 scope。
 
 设备未重启时，可信当前时间为“服务器 Date + elapsedRealtime 增量”，不受用户修改墙上时钟影响。重启导致单调时钟回退时才使用 wall clock；过期比较为 fail closed。
 
