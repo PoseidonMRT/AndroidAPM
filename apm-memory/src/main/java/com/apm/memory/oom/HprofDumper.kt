@@ -2,15 +2,18 @@ package com.apm.memory.oom
 
 import android.content.Context
 import android.os.Debug
-import com.apm.core.Apm
 import com.apm.core.ApmClock
 import com.apm.core.ApmExecutors
 import com.apm.core.ApmLogger
 import com.apm.memory.MemoryConfig
+import com.apm.memory.MemoryReport
+import com.apm.memory.MemoryReportSink
+import com.apm.memory.ApmMemoryReportSink
 import com.apm.model.ApmEventKind
 import com.apm.model.ApmSeverity
 import com.apm.model.ApmPriority
 import java.io.File
+import java.util.concurrent.RejectedExecutionException
 
 /**
  * Hprof 文件 Dump 器。
@@ -23,7 +26,26 @@ import java.io.File
  * @param config 内存模块配置（含 dump 阈值与 fork dump 开关）
  * @param logger 日志接口
  */
-internal class HprofDumper(private val context: Context, private val config: MemoryConfig, private val logger: ApmLogger) {
+internal class HprofDumper(
+    /** Application storage owner. */
+    private val context: Context,
+    /** Dump policy for this module session. */
+    private val config: MemoryConfig,
+    /** Session diagnostic destination. */
+    private val logger: ApmLogger,
+    /** Injectable ART boundary; slow dumps execute outside the shutdown/handoff lock. */
+    private val directDump: (File) -> Unit = { Debug.dumpHprofData(it.absolutePath) },
+    /** Destination used only while this dumper's original session remains open. */
+    private val reportSink: MemoryReportSink = ApmMemoryReportSink,
+    /** Production bridge resolves host context before asking this dumper to guard final admission. */
+    private val guardedReport: ((MemoryReport, (() -> Boolean) -> Boolean) -> Unit)? = null,
+    /** Filename timestamp source; exclusive creation also protects repeated dumps in the same millisecond. */
+    private val wallTimeMillis: () -> Long = ApmClock::wallTimeMillis
+) {
+    /** Serializes permanent closure with final event delivery, never with heap IO. */
+    private val sessionLock = Any()
+    /** Closed dumpers cannot be revived by a new MemoryModule/SDK initialization. */
+    @Volatile private var closed = false
     /** dump 工作线程：执行 Debug.dumpHprofData 会产生 1~3s STW，故使用最低优先级后台线程降低对宿主的影响。 */
     private val dumpExecutor = ApmExecutors.newSingleThreadExecutor(THREAD_NAME)
 
@@ -65,7 +87,14 @@ internal class HprofDumper(private val context: Context, private val config: Mem
         if (!config.enableHprofDump) {
             return
         }
-        dumpExecutor.execute { dumpInternal(reason) }
+        synchronized(sessionLock) {
+            if (closed) return
+            try {
+                dumpExecutor.execute { if (!closed) dumpInternal(reason) }
+            } catch (_: RejectedExecutionException) {
+                // Concurrent closure is a cancelled observation, not a host-visible exception.
+            }
+        }
     }
 
     /**
@@ -74,7 +103,17 @@ internal class HprofDumper(private val context: Context, private val config: Mem
      * 流程：生成文件 → dump → 可选 strip → 上报文件事件。
      */
     private fun dumpInternal(reason: String) {
-        val hprofFile = File(hprofDir, "${ApmClock.wallTimeMillis()}_${reason.replaceNonAlpha()}$HPROF_EXTENSION")
+        val hprofFile = try {
+            // Reserve a unique path atomically: timestamps alone collide during repeated/manual dumps.
+            File.createTempFile(
+                "${wallTimeMillis()}_${reason.replaceNonAlpha().take(MAX_REASON_FILENAME_LENGTH)}_",
+                HPROF_EXTENSION,
+                hprofDir
+            )
+        } catch (e: Exception) {
+            logger.e("HprofDumper failed to create output", e)
+            return
+        }
 
         try {
             // 优先使用 fork 子进程 dump（无 STW）
@@ -93,16 +132,21 @@ internal class HprofDumper(private val context: Context, private val config: Mem
                 dumpDirectly(hprofFile)
             }
         } catch (e: Exception) {
+            hprofFile.delete()
             logger.e("HprofDumper failed", e)
             return
         }
 
+        // ART may finish after shutdown even when it ignores interruption. Remove its late artifact.
+        if (discardIfClosed(hprofFile)) return
+
         // dump 失败或文件为空，不继续处理
         if (!hprofFile.exists() || hprofFile.length() == 0L) {
+            hprofFile.delete()
             return
         }
 
-        // 可选 strip 裁剪（减少 60%~80% 文件大小）
+        // Clear primitive payloads with equal-length zeros; this preserves file size and metadata.
         val uploadFile = if (config.enableHprofStrip) {
             val strippedFile = File(hprofDir, hprofFile.nameWithoutExtension + STRIPPED_SUFFIX)
             val processor = HprofStripProcessor()
@@ -116,9 +160,10 @@ internal class HprofDumper(private val context: Context, private val config: Mem
             }
         } else hprofFile
 
-        // 上报文件生成事件
-        Apm.emit(
-            module = MODULE,
+        if (discardIfClosed(uploadFile)) return
+        // Bound long-lived sessions too. Preserve this exact report target even when mtimes tie or regress.
+        pruneOldFiles(DEFAULT_MAX_FILES, uploadFile)
+        val report = MemoryReport(
             name = EVENT_HPROF_DUMP,
             kind = ApmEventKind.FILE,
             severity = ApmSeverity.INFO, priority = ApmPriority.HIGH,
@@ -128,11 +173,31 @@ internal class HprofDumper(private val context: Context, private val config: Mem
                 "fileSizeKb" to uploadFile.length() / BYTES_PER_KB
             )
         )
+        if (guardedReport != null) {
+            // Business-context callbacks run outside our lock; only the final admission is guarded.
+            guardedReport.invoke(report, ::handoff)
+        } else {
+            handoff { reportSink.emit(report); true }
+        }
+        discardIfClosed(uploadFile)
+    }
+
+    /** Discards only this job's artifact after permanent session cancellation. */
+    private fun discardIfClosed(file: File): Boolean {
+        if (!closed) return false
+        file.delete()
+        return true
+    }
+
+    /** Guards only final delivery; shutdown permanently closes the same token without waiting on heap IO. */
+    private fun handoff(action: () -> Boolean): Boolean = synchronized(sessionLock) {
+        if (closed) return false
+        action()
     }
 
     /** 直接调用 Debug.dumpHprofData。 */
     private fun dumpDirectly(outputFile: File) {
-        Debug.dumpHprofData(outputFile.absolutePath)
+        directDump(outputFile)
     }
 
     /**
@@ -181,16 +246,27 @@ internal class HprofDumper(private val context: Context, private val config: Mem
 
     /** 关闭 dump 工作线程。 */
     fun shutdown() {
-        dumpExecutor.shutdown()
+        synchronized(sessionLock) { closed = true }
+        // Drop queued dumps and interrupt cooperative work; an in-flight ART dump cleans up on return.
+        dumpExecutor.shutdownNow()
     }
 
     /**
-     * 清理旧 hprof 文件，保留最近的 maxFiles 个。
-     * 在模块启动时调用。
+     * 清理旧 hprof 文件，原始与 strip 产物共享 maxFiles 个文件的保留预算。
+     * 在模块启动时调用；每次成功 dump 也会执行同一清理规则。
      */
     fun cleanupOldFiles(maxFiles: Int = DEFAULT_MAX_FILES) {
-        val files = hprofDir.listFiles { f -> f.name.endsWith(HPROF_EXTENSION) }
-            ?.sortedByDescending { it.lastModified() }
+        pruneOldFiles(maxFiles.coerceAtLeast(0), null)
+    }
+
+    /** Retains the file about to be reported before ranking older raw/stripped artifacts together. */
+    private fun pruneOldFiles(maxFiles: Int, reportFile: File?) {
+        val files = hprofDir.listFiles { f -> f.isFile && f.name.endsWith(HPROF_EXTENSION) }
+            ?.sortedWith(
+                compareByDescending<File> { it == reportFile }
+                    .thenByDescending { it.lastModified() }
+                    .thenBy { it.name }
+            )
             ?: return
         // 超出保留数量的旧文件删除
         if (files.size > maxFiles) {
@@ -199,8 +275,6 @@ internal class HprofDumper(private val context: Context, private val config: Mem
     }
 
     companion object {
-        /** 模块名。 */
-        private const val MODULE = "memory"
         /** 工作线程名。 */
         private const val THREAD_NAME = "hprof-dumper"
         /** hprof 文件存储路径。 */
@@ -217,6 +291,8 @@ internal class HprofDumper(private val context: Context, private val config: Mem
         private const val REPLACEMENT_CHAR = "_"
         /** 默认保留文件数。 */
         private const val DEFAULT_MAX_FILES = 5
+        /** Bounds the host-supplied reason portion below common filesystem filename limits. */
+        private const val MAX_REASON_FILENAME_LENGTH = 64
         /** 字节/KB。 */
         private const val BYTES_PER_KB = 1024L
         /** fork dump JNI 库名。 */

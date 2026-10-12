@@ -1,6 +1,6 @@
 # apm-memory 模块
 
-> 同步日期：2026-07-16｜模块名：`memory`
+> 同步日期：2026-10-13｜模块名：`memory`
 
 ## 目的与入口
 
@@ -15,8 +15,8 @@
 - `FragmentLeakDetector`：Fragment 生命周期
 - `ViewModelLeakDetector`：检查 Context/View 持有
 - `OomMonitor`：heap/PSS/native/system trim 阈值
-- `HprofDumper`：直接或可选 fork dump、可选 strip、最多保留 5 个文件
-- `HprofStripProcessor`：二进制 Hprof primitive array 清理；截断 header/record 返回失败并删除部分输出
+- `HprofDumper`：直接或可选 fork dump、可选 strip，模块启动与每次成功 dump 后清理，raw/strip 合计最多保留 5 个文件；当前报告文件优先保留，独占临时路径避免同毫秒覆盖
+- `HprofStripProcessor`：以 8 KiB 缓冲流式解析 4/8 字节 ID 与 ART heap/root/class/array 布局，保留结构并等长清零 primitive payload；不缩减文件大小。非法 header/record/type、截断或取消返回失败并删除部分输出
 - `ReferenceChainAnalyzer`：Hprof 索引与 BFS 引用路径
 - `NativeHeapMonitor`：`Debug.getNativeHeapAllocatedSize`
 
@@ -42,7 +42,7 @@
 
 ## 线程与资源
 
-周期采样和 leak check 使用 `ApmExecutors`/HandlerThread；Hprof dump 使用后台 executor。Hprof 是大文件操作，默认关闭并有 cooldown/文件数限制。fork dump 依赖设备/ART 兼容性，失败回退直接 dump。
+周期采样和 leak check 使用 `ApmExecutors`/HandlerThread；Hprof dump 使用后台 executor。Hprof 是大文件操作，默认关闭并有 cooldown/文件数限制。模块关闭会丢弃排队 dump，永久关闭最终文件/事件交接；无法中断的 ART dump 返回后删除迟到产物，旧上下文不进入新 runtime。fork dump 依赖设备/ART 兼容性，失败回退直接 dump。
 
 ## 降级与边界
 

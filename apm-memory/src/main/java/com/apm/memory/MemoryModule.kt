@@ -12,6 +12,7 @@ import androidx.lifecycle.ProcessLifecycleOwner
 import com.apm.core.Apm
 import com.apm.core.ApmContext
 import com.apm.core.ApmModule
+import com.apm.model.ApmEvent
 import com.apm.memory.leak.LeakCheckQueue
 import com.apm.memory.leak.ActivityLeakDetector
 import com.apm.memory.leak.FragmentLeakDetector
@@ -154,7 +155,17 @@ class MemoryModule(private val config: MemoryConfig = MemoryConfig()) : ApmModul
         // Phase 3: OOM 预警 + Hprof Dump
         if (config.enableOomMonitor) {
             if (config.enableHprofDump) {
-                hprofDumper = HprofDumper(apmContext.application, config, apmContext.logger)
+                val dumpContext = apmContext
+                hprofDumper = HprofDumper(
+                    dumpContext.application, config, dumpContext.logger,
+                    guardedReport = { report, guard ->
+                        dumpContext.emitInSession(ApmEvent(
+                            module = MODULE_NAME, name = report.name, kind = report.kind,
+                            severity = report.severity, priority = report.priority,
+                            scene = report.scene, foreground = report.foreground, fields = report.fields
+                        ), critical = false, handoffGuard = guard)
+                    }
+                )
                 hprofDumper?.init()
                 hprofDumper?.cleanupOldFiles()
             }
