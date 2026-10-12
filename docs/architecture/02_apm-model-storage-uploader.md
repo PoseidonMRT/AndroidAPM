@@ -203,7 +203,7 @@ interface BatchApmUploader : ApmUploader {
 - 所有 header 在获取 output stream 前设置
 - legacy 格式以 2xx 为成功；V2 还要求 exact whole-batch ACK
 - 429/503 解析 `Retry-After` 秒数或 HTTP-date；超大秒数做饱和乘法，再由 worker 限制为 60 秒
-- 完整 drain/close response/error stream，允许 keep-alive 复用
+- ACK 仅按响应 Header 判断；只排空已到达、已知长度且不超过 64 KiB 的 plain response/error body以尝试 keep-alive，遇到未知/压缩/大响应或尚未到达的字节立即断开，不等待 EOF。排空失败不改变 Header ACK 判定
 - 网络异常返回 false 并 disconnect
 
 legacy 每个序列化事件包含 eventId，但没有 batch ID，HTTP 2xx 是整批唯一确认信号。V2/V3 body 都是 `ApmBatchEnvelope`：包含 schema/SDK、固定 resource、retry-stable batchId、repeated events 和 field-15 typed values；V3 还要求每个 event 的 field-16 occurrence，并使用 schema byte 3 与 `b3-` prefix。gzip 前完整 envelope 默认限制 1 MiB、绝对 4 MiB，按实际编码拆分（serializer 每事件只编码一次，用单事件探针锚定固定组件大小后以精确增量字节判定拆分边界），单事件超预算不打开连接。transport 拥有 `X-Apm-Schema-Version` / `Sdk-Version` / `Batch-Id` / `Event-Count`，宿主 Header 不能覆盖；response schema/batchId/eventCount 全匹配才成功，不支持 partial ACK。schema/eventCount 只接受正整数的规范无符号十进制，拒绝前导零、正号、负号和溢出；batchId 逐字节匹配。前一物理 batch 已 ACK、后一批失败时逻辑 claim 返回失败并可能整组重发，Collector 继续按 eventId 去重。当前 strict 规范见 [V3](../protocol/COLLECTOR_WIRE_V3.md)，兼容规范见 [V2](../protocol/COLLECTOR_WIRE_V2.md)。动态凭据 provider 失败时返回 false，durable outbox 不删除该批；不会缓存并复用上一个可能已撤销的 Token。core strict built-in HTTP 在 factory 之前要求 HTTPS/V3/resource/occurrence/batch headroom（显式非 Logcat custom uploader 除外）；当前自动 Provider 无 occurrence-aware overload，不能承担 V3 初始化。同意撤回先停止 persistent worker/uploader，再调用 store clear；冷启动 overload 同时清理 SQLite、File 与 IPC artifacts。
@@ -228,13 +228,13 @@ claimPending(owner, lease)
 仅用于非 durable store：
 
 - `PriorityBlockingQueue`
-- Semaphore 硬容量 500
-- 满时仅允许更高优先级事件淘汰低优先级事件
+- queued/in-flight/delayed retry 共用 500 条生命周期容量；出队不会提前释放槽位
+- 满时仅允许更高优先级事件淘汰 queued/delayed 的低优先级事件，不淘汰正在执行的 delegate
 - drain batch，delegate 为 Batch 时一批调用
-- 失败批次由独立 scheduled executor 延迟重投
+- 失败批次由独立 scheduled executor 延迟重入队列；scheduler 不调用 delegate，所有实际上传由唯一 worker 串行执行
 - worker 与 scheduler 由同一模块内命名 factory 创建，显式 daemon / `Thread.MIN_PRIORITY`
 - 不使用 `Thread.sleep`
-- shutdown 有界 drain；尚未到期的内存 retry 会被放弃
+- shutdown 有界 drain；尚未到期的内存 retry 会被取消并释放 payload，容量淘汰也取消对应延迟任务
 
 这条路径是 best effort，不替代 SQLite outbox。线程 factory 保持 `apm-uploader -> apm-model` 的依赖边界，不反向依赖 `apm-core`；稳定线程名为 `apm-upload-retry` 与 `apm-upload-retry-scheduler`。
 

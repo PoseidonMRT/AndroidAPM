@@ -313,9 +313,11 @@ class HttpApmUploader(
             val responseCode = connection.responseCode
             if (stopped) return false
 
-            // 读尽并关闭响应流：不排空响应体会阻止 HttpURLConnection
-            // 归还底层连接（keep-alive 失效），错误路径还可能泄漏连接
-            drainResponse(connection, responseCode)
+            // 仅尝试排空已经可读的有界正文；其他正文主动断开，避免占用交付 worker。
+            if (!drainResponse(connection, responseCode)) {
+                // ACK uses headers only. A large or trickling body must not monopolize delivery.
+                disconnectSafely(connection)
+            }
 
             // 限流/服务不可用时解析服务端建议的重试延迟，其余情况清除旧提示
             lastRetryAfterMs = if (
@@ -475,31 +477,66 @@ class HttpApmUploader(
     }
 
     /**
-     * 读尽并关闭 HTTP 响应流。
+     * Best-effort drain of a small, immediately available response body for connection reuse.
      *
-     * 成功响应读 inputStream，错误响应读 errorStream；
-     * 排空失败不影响上传结果判定。
+     * Transfer framing, compression, unknown/large bodies, or unavailable bytes abandon reuse.
+     * The caller disconnects abandoned responses; header-based ACK and status decisions remain unchanged.
      *
      * @param connection 当前 HTTP 连接
      * @param responseCode 已读取的响应码
+     * @return true when no body remains; false when the connection must be discarded
      */
-    private fun drainResponse(connection: HttpURLConnection, responseCode: Int) {
+    private fun drainResponse(connection: HttpURLConnection, responseCode: Int): Boolean {
         try {
+            if (connection.getHeaderField(HEADER_TRANSFER_ENCODING) != null) {
+                // Transfer-Encoding overrides Content-Length; chunk framing can wait even with available bytes.
+                return false
+            }
+            val bodyLength = connection.contentLengthLong
+            if (bodyLength == 0L) return true
+            if (bodyLength < 0L || bodyLength > MAX_RESPONSE_DRAIN_BYTES ||
+                connection.getHeaderField(HEADER_CONTENT_ENCODING) != null
+            ) {
+                // Unknown framing, compression, and large bodies cannot be safely drained for reuse.
+                return false
+            }
             // 4xx/5xx 的响应体在 errorStream 中，2xx/3xx 在 inputStream 中
             val stream: InputStream? = if (responseCode >= HTTP_CLIENT_ERROR) {
                 connection.errorStream
             } else {
                 connection.inputStream
             }
-            stream?.use { input ->
+            if (stream == null) return false
+            var reachedEof = false
+            try {
+                val input = stream
                 val buffer = ByteArray(DRAIN_BUFFER_SIZE)
-                // 循环读取直到 EOF，内容直接丢弃，只为让连接可复用
-                while (!stopped && input.read(buffer) != -1) {
-                    // 丢弃响应内容
+                val deadlineNanos = System.nanoTime() + MAX_RESPONSE_DRAIN_MS * NANOS_PER_MILLISECOND
+                var remainingBytes = bodyLength.toInt()
+                while (!stopped && remainingBytes > 0) {
+                    val remainingNanos = deadlineNanos - System.nanoTime()
+                    if (remainingNanos <= 0L) return false
+                    // Setting readTimeout after connect does not update every platform's socket.
+                    // Only consume bytes already available; never wait for an optional response body.
+                    val availableBytes = input.available()
+                    if (availableBytes <= 0) return false
+                    val count = input.read(buffer, 0, minOf(buffer.size, remainingBytes, availableBytes))
+                    if (count == -1) {
+                        reachedEof = true
+                        return true
+                    }
+                    remainingBytes -= count
                 }
+                reachedEof = remainingBytes == 0
+                return reachedEof
+            } finally {
+                // Disconnect before close: some stream close implementations try to drain unread bytes.
+                if (!reachedEof) disconnectSafely(connection)
+                stream.close()
             }
         } catch (_: Exception) {
             // 排空失败（流已关闭/网络中断）不影响上传结果
+            return false
         }
     }
 
@@ -562,6 +599,9 @@ class HttpApmUploader(
         /** Header: Content-Encoding。 */
         private const val HEADER_CONTENT_ENCODING = "Content-Encoding"
 
+        /** Transfer framing must never enter the optional nonblocking drain path. */
+        private const val HEADER_TRANSFER_ENCODING = "Transfer-Encoding"
+
         /** Content-Type: 纯文本（Line Protocol）。 */
         private const val CONTENT_TYPE_TEXT = "text/plain; charset=utf-8"
 
@@ -609,6 +649,15 @@ class HttpApmUploader(
 
         /** 响应排空缓冲区大小（字节）。 */
         private const val DRAIN_BUFFER_SIZE = 4096
+
+        /** Maximum response bytes discarded for optional connection reuse. */
+        private const val MAX_RESPONSE_DRAIN_BYTES = 64 * 1024
+
+        /** Monotonic CPU/drain deadline; unavailable bytes cause immediate disconnect instead of waiting. */
+        private const val MAX_RESPONSE_DRAIN_MS = 1_000L
+
+        /** Monotonic-clock conversion used to bound every response read. */
+        private const val NANOS_PER_MILLISECOND = 1_000_000L
 
         /** Gzip 压缩内部缓冲大小（字节），覆盖已驻内存 payload 的单次写出。 */
         private const val GZIP_BUFFER_SIZE = 8 * 1024

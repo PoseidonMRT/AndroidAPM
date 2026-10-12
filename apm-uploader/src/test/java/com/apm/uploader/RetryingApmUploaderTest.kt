@@ -3,6 +3,7 @@ package com.apm.uploader
 import com.apm.model.ApmEvent
 import com.apm.model.ApmEventKind
 import com.apm.model.ApmSeverity
+import com.apm.model.ApmPriority
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -80,9 +81,118 @@ class RetryingApmUploaderTest {
         assertTrue(successLatch.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS))
         assertEquals(2, delegate.invocationThreads.size)
         assertThreadPolicy(delegate.invocationThreads[0], WORKER_THREAD_NAME)
-        assertThreadPolicy(delegate.invocationThreads[1], RETRY_SCHEDULER_THREAD_NAME)
+        assertThreadPolicy(delegate.invocationThreads[1], WORKER_THREAD_NAME)
 
         uploader.shutdown()
+    }
+
+    /** Delayed retries retain the same 500-event admission capacity after the visible queue drains. */
+    @Test
+    fun `delayed retries remain within the admission capacity`() {
+        val attempted = CountDownLatch(QUEUE_CAPACITY)
+        val delegate = object : ApmUploader {
+            override fun upload(event: ApmEvent): Boolean {
+                attempted.countDown()
+                return false
+            }
+        }
+        val uploader = RetryingApmUploader(
+            delegate, RetryPolicy(maxRetries = 1, baseDelayMs = LONG_RETRY_DELAY_MS,
+                maxDelayMs = LONG_RETRY_DELAY_MS), batchSize = 1,
+            flushIntervalMs = FLUSH_INTERVAL_MS, logger = SILENT_LOGGER
+        )
+        try {
+            repeat(QUEUE_CAPACITY) { assertTrue(uploader.upload(createEvent("held-$it"))) }
+            assertTrue(attempted.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+            assertEquals(0, uploader.queueSize())
+            assertFalse("Delayed payloads must still consume capacity", uploader.upload(createEvent("overflow")))
+            assertTrue("Higher priority may evict a delayed lower-priority entry",
+                uploader.upload(createEvent("priority").copy(priority = ApmPriority.HIGH)))
+            assertFalse(uploader.upload(createEvent("overflow-again")))
+        } finally {
+            uploader.shutdown()
+        }
+    }
+
+    /** An active exchange consumes capacity alongside queued events, then successful work releases it. */
+    @Test
+    fun `in flight exchange holds capacity until completion`() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val completed = CountDownLatch(QUEUE_CAPACITY)
+        val delegate = object : ApmUploader {
+            override fun upload(event: ApmEvent): Boolean {
+                entered.countDown()
+                release.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                completed.countDown()
+                return true
+            }
+        }
+        val uploader = RetryingApmUploader(delegate, batchSize = 1,
+            flushIntervalMs = FLUSH_INTERVAL_MS, logger = SILENT_LOGGER)
+        try {
+            assertTrue(uploader.upload(createEvent("in-flight")))
+            assertTrue(entered.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+            repeat(QUEUE_CAPACITY - 1) { assertTrue(uploader.upload(createEvent("queued-$it"))) }
+            assertFalse(uploader.upload(createEvent("overflow")))
+            release.countDown()
+            assertTrue(completed.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+            assertTrue(uploader.upload(createEvent("released-capacity")))
+        } finally {
+            release.countDown()
+            uploader.shutdown()
+        }
+    }
+
+    /** Due retries return to the sole worker while another initial exchange is blocked. */
+    @Test
+    fun `retry does not invoke delegate concurrently with fresh work`() {
+        val initial = CountDownLatch(1)
+        val blocked = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val retried = CountDownLatch(1)
+        val active = AtomicInteger()
+        val maximumActive = AtomicInteger()
+        val retryAttempts = AtomicInteger()
+        val delegate = object : ApmUploader {
+            override fun upload(event: ApmEvent): Boolean {
+                val current = active.incrementAndGet()
+                maximumActive.updateAndGet { maxOf(it, current) }
+                try {
+                    if (event.name == "retry-serialized") {
+                        if (retryAttempts.getAndIncrement() == 0) {
+                            initial.countDown()
+                            return false
+                        }
+                        retried.countDown()
+                        return true
+                    }
+                    blocked.countDown()
+                    release.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                    return true
+                } finally {
+                    active.decrementAndGet()
+                }
+            }
+        }
+        val uploader = RetryingApmUploader(delegate,
+            RetryPolicy(maxRetries = 1, baseDelayMs = SERIAL_RETRY_DELAY_MS,
+                maxDelayMs = SERIAL_RETRY_DELAY_MS), batchSize = 1,
+            flushIntervalMs = FLUSH_INTERVAL_MS, logger = SILENT_LOGGER)
+        try {
+            assertTrue(uploader.upload(createEvent("retry-serialized")))
+            assertTrue(initial.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+            assertTrue(uploader.upload(createEvent("block-fresh")))
+            assertTrue(blocked.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+            assertFalse("Retry must wait for the worker exchange",
+                retried.await(SERIAL_RETRY_DELAY_MS * 2, TimeUnit.MILLISECONDS))
+            release.countDown()
+            assertTrue(retried.await(AWAIT_TIMEOUT_SECONDS, TimeUnit.SECONDS))
+            assertEquals(1, maximumActive.get())
+        } finally {
+            release.countDown()
+            uploader.shutdown()
+        }
     }
 
     /**
@@ -172,7 +282,20 @@ class RetryingApmUploaderTest {
         /** Expected main in-memory retry worker name. */
         private const val WORKER_THREAD_NAME = "apm-upload-retry"
 
-        /** Expected delayed retry scheduler name. */
-        private const val RETRY_SCHEDULER_THREAD_NAME = "apm-upload-retry-scheduler"
+        /** Shared capacity includes active and scheduled payloads. */
+        private const val QUEUE_CAPACITY = 500
+
+        /** Delayed retries stay pending throughout capacity assertions. */
+        private const val LONG_RETRY_DELAY_MS = 60_000L
+
+        /** Allows fresh work to occupy the delegate before the first retry is due. */
+        private const val SERIAL_RETRY_DELAY_MS = 100L
+
+        /** Unit-test logger isolates saturation assertions from Android Log stubs. */
+        private val SILENT_LOGGER = object : UploaderLogger {
+            override fun d(message: String) = Unit
+            override fun w(message: String) = Unit
+            override fun e(message: String, throwable: Throwable?) = Unit
+        }
     }
 }

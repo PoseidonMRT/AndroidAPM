@@ -5,8 +5,8 @@ import com.apm.model.ApmPriority
 import java.util.concurrent.Executors
 import java.util.concurrent.PriorityBlockingQueue
 import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.Semaphore
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.ThreadFactory
 import java.util.concurrent.TimeUnit
 
@@ -58,9 +58,9 @@ data class RetryPolicy(
  * 带重试和批量的上传器。
  * 包装底层上传器，提供：优先级队列缓冲、批量发送、指数退避重试。
  *
- * 线程安全：内部使用单线程执行器 + PriorityBlockingQueue。
+ * 线程安全：所有首次和重试调用均使用同一 worker；延期 task 仅重新排队。
  * 队列按 priority.value DESC 排序（CRITICAL 优先出队），
- * 队列超容量时丢弃 LOW 优先级事件。
+ * 500 条容量覆盖队列、执行中和延期重试；满时淘汰尚未交付的较低优先级事件。
  */
 class RetryingApmUploader(
     /** 被包装的底层上传器。 */
@@ -80,13 +80,13 @@ class RetryingApmUploader(
      * CRITICAL(3) 最先出队，LOW(0) 最后出队。
      * PriorityBlockingQueue 是无界的，通过显式容量检查控制内存。
      */
-    private val queue = PriorityBlockingQueue<ApmEvent>(
+    private val queue = PriorityBlockingQueue<PendingUpload>(
         QUEUE_INITIAL_CAPACITY,
-        UploadPriorityComparator
+        Comparator { left, right -> UploadPriorityComparator.compare(left.event, right.event) }
     )
 
-    /** Hard capacity permits shared by producers and the worker. */
-    private val capacityPermits = Semaphore(QUEUE_CAPACITY)
+    /** Accepted events across queued, active, and delayed states; guarded by [acceptanceLock]. */
+    private val pendingUploads = LinkedHashSet<PendingUpload>()
 
     /** Serializes event acceptance with the shutdown state transition. */
     private val acceptanceLock = Any()
@@ -100,10 +100,13 @@ class RetryingApmUploader(
      * 重试调度器：失败批次延迟后重新尝试，
      * 退避等待不再阻塞主 drain 线程（新批次可继续上传）。
      */
-    private val retryScheduler: ScheduledExecutorService =
-        Executors.newSingleThreadScheduledExecutor(
-            backgroundThreadFactory(RETRY_SCHEDULER_THREAD_NAME)
-        )
+    private val retryScheduler = ScheduledThreadPoolExecutor(
+        1,
+        backgroundThreadFactory(RETRY_SCHEDULER_THREAD_NAME)
+    ).apply {
+        // Eviction cancels delayed events immediately, including their retained payload closures.
+        removeOnCancelPolicy = true
+    }
 
     /** 运行标志。volatile 保证工作线程可见性。 */
     @Volatile
@@ -127,16 +130,18 @@ class RetryingApmUploader(
             if (!running) {
                 return false
             }
-            if (!capacityPermits.tryAcquire()) {
+            if (pendingUploads.size >= QUEUE_CAPACITY) {
                 val evicted = evictLowerPriority(event)
-                if (!evicted || !capacityPermits.tryAcquire()) {
+                if (!evicted) {
                     logger.w(
-                        "Queue at hard capacity ($QUEUE_CAPACITY), dropping ${event.priority} event: ${event.name}"
+                        "Uploader at hard capacity ($QUEUE_CAPACITY), dropping ${event.priority} event: ${event.name}"
                     )
                     return false
                 }
             }
-            queue.offer(event)
+            val pending = PendingUpload(event)
+            pendingUploads.add(pending)
+            queue.offer(pending)
             return true
         }
     }
@@ -147,7 +152,14 @@ class RetryingApmUploader(
     override fun shutdown() {
         synchronized(acceptanceLock) {
             running = false
+            // Future retries are abandoned on shutdown; queued events retain the bounded drain.
+            for (pending in pendingUploads.toList()) {
+                if (pending.state == UploadState.RETRY_WAIT) {
+                    completeLocked(pending)
+                }
+            }
         }
+        retryScheduler.shutdownNow()
         // Wake poll/sleep so the worker can drain already accepted events.
         executor.shutdownNow()
         try {
@@ -157,8 +169,12 @@ class RetryingApmUploader(
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
         }
-        // 关闭重试调度器：未到期的重投任务被放弃（内存路径尽力而为）
-        retryScheduler.shutdownNow()
+        synchronized(acceptanceLock) {
+            // An uncooperative delegate must not retain queued payloads after the drain deadline.
+            for (pending in pendingUploads.toList()) {
+                completeLocked(pending)
+            }
+        }
         delegate.shutdown()
     }
 
@@ -172,35 +188,36 @@ class RetryingApmUploader(
     /**
      * Evicts one lower-priority event when the queue is full.
      *
-     * 单趟手工扫描替代 filter + minWithOrNull 的两个中间 list 分配：
-     * 维护最优候选引用即可完成同样的 (priority, timestamp) 最小值选择。
+     * Scans queued and delayed entries once, selecting the same minimum priority/oldest timestamp.
+     * In-flight entries remain owned by the delegate and cannot be evicted.
      *
      * @param incoming event competing for capacity
      * @return true when an event was removed
      */
     private fun evictLowerPriority(incoming: ApmEvent): Boolean {
-        synchronized(queue) {
-            var candidate: ApmEvent? = null
-            for (event in queue) {
-                if (event.priority.value >= incoming.priority.value) {
-                    // 只逐出严格更低优先级的候选
-                    continue
-                }
-                val current = candidate
-                if (current == null ||
-                    event.priority.value < current.priority.value ||
-                    (event.priority.value == current.priority.value && event.timestamp < current.timestamp)
-                ) {
-                    candidate = event
-                }
+        // Callers hold acceptanceLock, so selection and terminal cancellation are atomic.
+        var candidate: PendingUpload? = null
+        for (pending in pendingUploads) {
+            val event = pending.event
+            if (pending.state == UploadState.IN_FLIGHT) {
+                // An exchange already handed to the delegate cannot safely be withdrawn.
+                continue
             }
-            val victim = candidate ?: return false
-            if (queue.remove(victim)) {
-                capacityPermits.release()
-                return true
+            if (event.priority.value >= incoming.priority.value) {
+                // 只逐出严格更低优先级的候选
+                continue
             }
-            return false
+            val current = candidate
+            if (current == null ||
+                event.priority.value < current.event.priority.value ||
+                (event.priority.value == current.event.priority.value && event.timestamp < current.event.timestamp)
+            ) {
+                candidate = pending
+            }
         }
+        val victim = candidate ?: return false
+        completeLocked(victim)
+        return true
     }
 
     /**
@@ -210,7 +227,7 @@ class RetryingApmUploader(
      * 3. 调用底层上传器发送，失败时按重试策略重试
      */
     private fun processLoop() {
-        val batch = mutableListOf<ApmEvent>()
+        val batch = mutableListOf<PendingUpload>()
         // running=false 后仍处理完队列中剩余事件
         while (running || queue.isNotEmpty()) {
             try {
@@ -218,18 +235,21 @@ class RetryingApmUploader(
                 // 阻塞等待第一条（超时后继续循环检查 running）
                 val first = queue.poll(flushIntervalMs, TimeUnit.MILLISECONDS)
                 if (first != null) {
-                    capacityPermits.release()
                     batch.add(first)
                     // 非阻塞取出更多事件凑够一批
-                    val drained = queue.drainTo(batch, batchSize - 1)
-                    if (drained > 0) {
-                        capacityPermits.release(drained)
+                    queue.drainTo(batch, batchSize - 1)
+                    synchronized(acceptanceLock) {
+                        // Eviction may race with poll/drain; only still-owned entries reach transport.
+                        batch.removeAll { it !in pendingUploads }
+                        for (pending in batch) {
+                            pending.state = UploadState.IN_FLIGHT
+                        }
                     }
                 }
                 if (batch.isEmpty()) {
                     continue
                 }
-                uploadBatchAttempt(batch.toList(), FIRST_ATTEMPT)
+                uploadBatchAttempt(batch.toList())
             } catch (_: InterruptedException) {
                 if (running) {
                     Thread.currentThread().interrupt()
@@ -247,10 +267,10 @@ class RetryingApmUploader(
      * 继续处理新批次 —— 单个失败批次的退避不再让整个队列停摆。
      * 超过最大重试次数后丢弃整批。
      *
-     * @param events 本批事件
-     * @param attempt 当前尝试序号（0 = 首次）
+     * @param pendingBatch accepted entries, each with its own retry count
      */
-    private fun uploadBatchAttempt(events: List<ApmEvent>, attempt: Int) {
+    private fun uploadBatchAttempt(pendingBatch: List<PendingUpload>) {
+        val events = pendingBatch.map(PendingUpload::event)
         val uploadSucceeded = try {
             // 只有整批事件都被底层 uploader 成功接收时才算本轮成功。
             if (delegate is BatchApmUploader) {
@@ -260,34 +280,87 @@ class RetryingApmUploader(
             }
         } catch (e: Exception) {
             // 传输异常按失败处理，走统一重投逻辑
-            logger.w("Upload attempt ${attempt + 1} threw: ${e.message}")
+            logger.w("Upload attempt threw: ${e.message}")
             false
         }
-        if (uploadSucceeded) {
-            return
-        }
-
-        val nextAttempt = attempt + 1
-        if (nextAttempt > retryPolicy.maxRetries) {
-            logger.e("Upload failed after ${retryPolicy.maxRetries} retries, dropping ${events.size} events")
-            return
-        }
-
-        // 按指数退避延迟重投；服务端 Retry-After 建议优先于本地退避
-        val delay = maxOf(
-            retryPolicy.delayForAttempt(nextAttempt),
+        val retryHintMs = if (uploadSucceeded) 0L else try {
+            // Host code executes outside the acceptance lock so producers remain responsive.
             delegate.retryAfterHintMs() ?: 0L
-        )
-        try {
-            retryScheduler.schedule(
-                { uploadBatchAttempt(events, nextAttempt) },
-                delay,
-                TimeUnit.MILLISECONDS
-            )
-        } catch (_: RejectedExecutionException) {
-            // 调度器已关闭（shutdown 期间），内存路径尽力而为，放弃重试
-            logger.w("Retry scheduler closed, dropping ${events.size} events")
+        } catch (error: Exception) {
+            logger.w("Retry hint failed: ${error.message}")
+            0L
         }
+        synchronized(acceptanceLock) {
+            for (pending in pendingBatch) {
+                if (pending !in pendingUploads) continue
+                val nextAttempt = pending.attempt + 1
+                if (uploadSucceeded || !running || nextAttempt > retryPolicy.maxRetries) {
+                    // Capacity belongs to the event until success, exhaustion, eviction, or shutdown.
+                    completeLocked(pending)
+                    continue
+                }
+                pending.attempt = nextAttempt
+                pending.state = UploadState.RETRY_WAIT
+                val delay = maxOf(
+                    retryPolicy.delayForAttempt(nextAttempt),
+                    retryHintMs
+                )
+                try {
+                    pending.retryFuture = retryScheduler.schedule(
+                        { enqueueRetry(pending) },
+                        delay,
+                        TimeUnit.MILLISECONDS
+                    )
+                } catch (_: RejectedExecutionException) {
+                    // Scheduler shutdown cannot strand an accepted entry or its capacity reservation.
+                    completeLocked(pending)
+                    logger.w("Retry scheduler closed, dropping one event")
+                }
+            }
+        }
+    }
+
+    /** Requeues a due retry; the scheduler never invokes the host delegate concurrently. */
+    private fun enqueueRetry(pending: PendingUpload) {
+        synchronized(acceptanceLock) {
+            if (!running || pending !in pendingUploads) return
+            pending.retryFuture = null
+            pending.state = UploadState.QUEUED
+            queue.offer(pending)
+        }
+    }
+
+    /** Releases one event exactly once and removes every queued or delayed payload reference. */
+    private fun completeLocked(pending: PendingUpload) {
+        if (!pendingUploads.remove(pending)) return
+        queue.remove(pending)
+        pending.retryFuture?.cancel(false)
+        pending.retryFuture = null
+    }
+
+    /** One accepted event and its bounded retry lifecycle; mutable fields use [acceptanceLock]. */
+    private class PendingUpload(
+        /** Immutable event retained until a terminal disposition. */
+        val event: ApmEvent
+    ) {
+        /** Number of retries already scheduled after the initial attempt. */
+        var attempt = FIRST_ATTEMPT
+
+        /** Current ownership state, including delayed work outside the visible queue. */
+        var state = UploadState.QUEUED
+
+        /** Cancellable delayed task, cleared before returning the event to the worker. */
+        var retryFuture: ScheduledFuture<*>? = null
+    }
+
+    /** Finite states counted against the same accepted-event capacity. */
+    private enum class UploadState {
+        /** Waiting for the sole transport worker. */
+        QUEUED,
+        /** Currently owned by a delegate exchange. */
+        IN_FLIGHT,
+        /** Retained by a bounded delayed retry task. */
+        RETRY_WAIT
     }
 
     companion object {

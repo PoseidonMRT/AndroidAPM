@@ -14,6 +14,7 @@ import org.junit.Test
 import java.io.BufferedInputStream
 import java.net.ServerSocket
 import java.net.SocketTimeoutException
+import java.net.SocketException
 import java.io.IOException
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
@@ -26,6 +27,126 @@ import java.util.zip.GZIPInputStream
  * Integration tests for HTTP batching and compression.
  */
 class HttpApmUploaderTest {
+
+    /** A large accepted response is capped by bytes and does not prevent the next exchange. */
+    @Test
+    fun `large response body cannot monopolize accepted delivery`() {
+        assertBoundedResponseBody(trickle = false)
+    }
+
+    /** Continuous bytes defeat inactivity timeouts but cannot force draining until response completion. */
+    @Test
+    fun `trickling response body obeys a total drain deadline`() {
+        assertBoundedResponseBody(trickle = true)
+    }
+
+    /** A socket already connected with a long timeout must not wait for optional delayed body bytes. */
+    @Test
+    fun `body pause after headers does not rely on changing connected socket timeout`() {
+        assertBoundedResponseBody(trickle = false, delayBody = true)
+    }
+
+    /** Standard chunk framing must discard its still-open socket instead of awaiting an incomplete chunk. */
+    @Test
+    fun `chunked response is discarded without waiting for incomplete framing`() {
+        assertBoundedResponseBody(trickle = false, chunkedBody = true)
+    }
+
+    /** Serves an oversized body followed by a normal exact-ACK response over real loopback sockets. */
+    private fun assertBoundedResponseBody(
+        trickle: Boolean,
+        delayBody: Boolean = false,
+        chunkedBody: Boolean = false
+    ) {
+        ServerSocket(0).use { server ->
+            val requestCount = AtomicInteger()
+            val serverFailure = AtomicReference<Throwable>()
+            val releaseBody = CountDownLatch(1)
+            val discardedChunkedConnection = CountDownLatch(1)
+            val serverThread = Thread {
+                try {
+                    repeat(2) { index ->
+                        server.accept().use { socket ->
+                            val input = BufferedInputStream(socket.getInputStream())
+                            val headers = readHeaders(input)
+                            input.readNBytes(headers.getValue("content-length").toInt())
+                            requestCount.incrementAndGet()
+                            val output = socket.getOutputStream()
+                            val head = "HTTP/1.1 200 OK\r\n" +
+                                "${ApmWireProtocol.HEADER_SCHEMA_VERSION}: 2\r\n" +
+                                "${ApmWireProtocol.HEADER_BATCH_ID}: ${headers.getValue(ApmWireProtocol.HEADER_BATCH_ID.lowercase(Locale.US))}\r\n" +
+                                "${ApmWireProtocol.HEADER_EVENT_COUNT}: 1\r\n" +
+                                (if (index == 0 && chunkedBody) "Transfer-Encoding: chunked\r\n"
+                                else "Content-Length: ${if (index == 0) { if (delayBody) 1 else Int.MAX_VALUE } else 0}\r\n") +
+                                "Connection: ${if (index == 0 && chunkedBody) "keep-alive" else "close"}\r\n\r\n"
+                            // Keep chunk framing incomplete while placing a byte after the response headers.
+                            output.write((head + if (index == 0 && chunkedBody) "1" else "")
+                                .toByteArray(Charsets.ISO_8859_1))
+                            output.flush()
+                            if (index == 0) {
+                                try {
+                                    if (chunkedBody) {
+                                        socket.soTimeout = MAX_DRAIN_TEST_MS.toInt()
+                                        try {
+                                            check(input.read() == -1) { "Unexpected request on undrained chunked connection" }
+                                        } catch (_: SocketException) {
+                                            // Closing an unread response can reset instead of gracefully ending the socket.
+                                        }
+                                        discardedChunkedConnection.countDown()
+                                    } else if (delayBody) {
+                                        releaseBody.await(STREAM_RESPONSE_SECONDS, TimeUnit.SECONDS)
+                                        output.write(0)
+                                        output.flush()
+                                    } else {
+                                        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(STREAM_RESPONSE_SECONDS)
+                                        val body = ByteArray(if (trickle) 1 else LARGE_RESPONSE_CHUNK_BYTES)
+                                        while (System.nanoTime() < deadline) {
+                                            output.write(body)
+                                            output.flush()
+                                            if (trickle) Thread.sleep(TRICKLE_INTERVAL_MS)
+                                        }
+                                    }
+                                } catch (_: IOException) {
+                                    // Budget exhaustion closes the first socket; a second POST must still arrive.
+                                }
+                            }
+                        }
+                    }
+                } catch (error: Exception) {
+                    serverFailure.set(error)
+                }
+            }.apply { isDaemon = true; name = "http-bounded-body-server"; start() }
+            val uploader = HttpApmUploader(
+                "http://127.0.0.1:${server.localPort}/events",
+                readTimeoutMs = if (delayBody || chunkedBody) LONG_STREAM_READ_TIMEOUT_MS else STREAM_READ_TIMEOUT_MS,
+                serializationFormat = SerializationFormat.PROTOBUF_ENVELOPE_V2,
+                resourceContext = RESOURCE,
+                logger = SILENT_LOGGER
+            )
+            try {
+                val start = System.nanoTime()
+                assertTrue("Exact ACK must remain sufficient after bounded body discard",
+                    uploader.uploadBatch(listOf(event("bounded-body"))))
+                val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start)
+                assertTrue("Response drain took ${elapsedMs}ms", elapsedMs < MAX_DRAIN_TEST_MS)
+                if (chunkedBody) {
+                    assertTrue("Chunked response must close without awaiting chunk completion",
+                        discardedChunkedConnection.await(MAX_DRAIN_TEST_MS, TimeUnit.MILLISECONDS))
+                }
+                releaseBody.countDown()
+                assertTrue(uploader.uploadBatch(listOf(event("after-bounded-body"))))
+                serverThread.join(TimeUnit.SECONDS.toMillis(TEST_TIMEOUT_SECONDS))
+                assertFalse(serverThread.isAlive)
+                assertNull(serverFailure.get())
+                assertEquals(2, requestCount.get())
+            } finally {
+                releaseBody.countDown()
+                uploader.shutdown()
+                server.close()
+                serverThread.join(TimeUnit.SECONDS.toMillis(TEST_TIMEOUT_SECONDS))
+            }
+        }
+    }
 
     /** Shutdown during a blocked response forbids subsequent physical batches and new admissions. */
     @Test
@@ -610,6 +731,24 @@ class HttpApmUploaderTest {
 
         /** Maximum wait for the local server. */
         private const val TEST_TIMEOUT_SECONDS = 5L
+
+        /** Original unbounded implementation remains active beyond the regression deadline. */
+        private const val STREAM_RESPONSE_SECONDS = 4L
+
+        /** A continuous trickle stays below this per-read inactivity timeout. */
+        private const val STREAM_READ_TIMEOUT_MS = 200
+
+        /** Exceeds the server body pause, exposing ineffective post-connect timeout changes. */
+        private const val LONG_STREAM_READ_TIMEOUT_MS = 5_000
+
+        /** Continuous response cadence that never reaches the inactivity timeout. */
+        private const val TRICKLE_INTERVAL_MS = 25L
+
+        /** Large chunks reach the response-byte budget quickly. */
+        private const val LARGE_RESPONSE_CHUNK_BYTES = 8 * 1024
+
+        /** Leaves scheduling headroom above the one-second total drain deadline. */
+        private const val MAX_DRAIN_TEST_MS = 2_500L
 
         /** HTTP 200 OK。 */
         private const val HTTP_OK = 200
