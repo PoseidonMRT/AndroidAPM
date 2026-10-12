@@ -1,6 +1,6 @@
 # apm-anr 模块
 
-> 同步日期：2026-07-31｜模块名：`anr`
+> 同步日期：2026-10-13｜模块名：`anr`
 
 ## 目的
 
@@ -47,7 +47,7 @@ ANR 报告不再进入 shared dispatcher queue，也不经过 sampling、aggrega
 
 ## 线程与资源
 
-Watchdog、flag poll 和 SIGQUIT analysis 为命名 daemon/measurement 线程。分析可能读取文件和多次采样，但不在 signal handler 或主线程执行。
+Watchdog、flag poll 和 SIGQUIT analysis 为命名 daemon/measurement 线程。分析可能读取文件和多次采样，但不在 signal handler 或主线程执行。每次模块启动拥有独立、永久取消的 detection session，隔离 tick、blocked 状态、dedup 和分析结果；停止后迟到采样不进入新模块会话。最终 critical 交接使用捕获的 `ApmContext.emitInSession`，业务上下文在门禁外采集，取消不等待任意宿主 store；已经准入的同步交接由 core 撤回屏障负责清理证明。
 
 ## 降级与边界
 

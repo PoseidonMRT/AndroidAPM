@@ -24,4 +24,5 @@ dependencies {
     api(project(":apm-core"))
     implementation(project(":apm-model"))
     testImplementation(libs.junit)
+    testImplementation(libs.robolectric)
 }

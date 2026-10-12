@@ -8,13 +8,12 @@ import com.apm.core.ApmContext
 import com.apm.core.ApmModule
 import com.apm.core.ApmExecutors
 import com.apm.model.ApmEventKind
+import com.apm.model.ApmEvent
 import com.apm.model.ApmSeverity
 import com.apm.model.ApmPriority
 import java.io.File
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Executes one synchronous ANR hand-off and surfaces a false result exactly once.
@@ -67,14 +66,8 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
     private var apmContext: ApmContext? = null
     /** 主线程 Handler，用于投递 tick。 */
     private val mainHandler = Handler(Looper.getMainLooper())
-    /** ANR 状态标记：已检测到 ANR 且尚未恢复。 */
-    private val anrDetected = AtomicBoolean(false)
-    /** Watchdog 线程的 tick 标记。 */
-    private val tick = AtomicBoolean(false)
-    /** First observed main-thread blockage time. */
-    private val blockedSinceMs = AtomicLong(0L)
-    /** 是否正在运行。 */
-    @Volatile private var running = false
+    /** Captured by every analysis/watch task; stopped generations are permanently closed. */
+    @Volatile private var detectionSession: AnrDetectionSession? = null
     /** Watchdog 线程引用。 */
     private var watchdogThread: Thread? = null
 
@@ -100,12 +93,6 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
     @Volatile
     private var sigquitPoller: SigquitFlagPoller? = null
 
-    // --- ANR 去重 ---
-    /** 上次 ANR 上报时间戳。 */
-    private val lastReportTimeMs = AtomicLong(0L)
-    /** 上次 ANR 堆栈指纹。 */
-    @Volatile private var lastStackFingerprint: String = ""
-
     // --- 堆栈采样 ---
     override fun onInitialize(context: ApmContext) {
         apmContext = context
@@ -116,8 +103,8 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
         if (!config.enableAnrMonitor) {
             return
         }
-        running = true
-        anrDetected.set(false)
+        val session = AnrDetectionSession()
+        detectionSession = session
         // SIGQUIT 分析属于时间敏感型信号处置，使用普通优先级避免被宿主负载饿死而延误 ANR 判定。
         sigquitAnalysisExecutor = ApmExecutors.newSingleThreadExecutor(
             SIGQUIT_ANALYSIS_THREAD_NAME,
@@ -134,17 +121,18 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
         // 组装 SIGQUIT 标志轮询器：测试替身优先，其次 native 源（注册成功时）
         val flagSource = sigquitFlagSourceOverride
             ?: if (sigquitReady) nativeSigquitSource else null
-        sigquitPoller = flagSource?.let { SigquitFlagPoller(it, ::onSigquitReceived) }
+        sigquitPoller = flagSource?.let { SigquitFlagPoller(it) { onSigquitReceived(session) } }
 
         // Watchdog remains active as the public, portable detection channel.
-        startWatchdog()
+        startWatchdog(session)
 
         apmContext?.logger?.d("ANR module started, sigquit=$sigquitReady")
     }
 
     /** 停止监控。 */
     override fun onStop() {
-        running = false
+        detectionSession?.close()
+        detectionSession = null
         sigquitPoller = null
         watchdogThread?.interrupt()
         watchdogThread = null
@@ -201,12 +189,12 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
      * 由 watchdog 线程在轮询到 native 标志（[SigquitFlagPoller]）时调用；
      * 信号处理器本身只写原子标志，绝不直接回调 Java。
      */
-    private fun onSigquitReceived() {
+    private fun onSigquitReceived(session: AnrDetectionSession) {
         // 将重分析工作切到独立线程，避免依赖已阻塞的主线程。
         sigquitAnalysisDispatcher.dispatch(
-            running = running,
-            anrDetected = anrDetected,
-            analysis = { handleAnrDetection(DETECTION_SIGQUIT) }
+            running = session.isActive(),
+            anrDetected = session.anrDetected,
+            analysis = { handleAnrDetection(session, DETECTION_SIGQUIT) }
         )
     }
 
@@ -234,8 +222,10 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
      * 启动 Watchdog 线程。
      * 当 SIGQUIT 不可用时作为降级方案。
      */
-    private fun startWatchdog() {
-        watchdogThread = Thread({ watchdogLoop() }, THREAD_NAME).apply {
+    private fun startWatchdog(session: AnrDetectionSession) {
+        val poller = sigquitPoller
+        watchdogThread = Thread({ watchdogLoop(session, poller) }, THREAD_NAME).apply {
+            isDaemon = true
             priority = Thread.MIN_PRIORITY
             start()
         }
@@ -245,13 +235,13 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
      * Watchdog 主循环。
      * 每轮：投递 tick → 等待 → 检查 tick 是否被消费。
      */
-    private fun watchdogLoop() {
-        while (running) {
+    private fun watchdogLoop(session: AnrDetectionSession, poller: SigquitFlagPoller?) {
+        while (session.isActive()) {
             // 先消费 native SIGQUIT 标志：系统投递的信号优先于 watchdog 推断
-            sigquitPoller?.pollOnce()
+            poller?.pollOnce()
 
-            tick.set(false)
-            mainHandler.post { tick.set(true) }
+            session.tick.set(false)
+            mainHandler.post { if (session.isActive()) session.tick.set(true) }
 
             try {
                 Thread.sleep(config.checkIntervalMs)
@@ -259,26 +249,26 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
                 break
             }
 
-            if (!running) {
+            if (!session.isActive()) {
                 break
             }
 
             // tick 未被消费且尚未报告过 ANR
-            if (!tick.get()) {
+            if (!session.tick.get()) {
                 val now = ApmClock.monotonicTimeMillis()
-                val blockedSince = blockedSinceMs.updateAndGet { previous ->
+                val blockedSince = session.blockedSinceMs.updateAndGet { previous ->
                     if (previous == 0L) now - config.checkIntervalMs else previous
                 }
                 val blockedDurationMs = now - blockedSince
-                if (blockedDurationMs >= config.anrTimeoutMs && !anrDetected.getAndSet(true)) {
-                    handleAnrDetection(DETECTION_WATCHDOG, blockedDurationMs)
+                if (blockedDurationMs >= config.anrTimeoutMs && !session.anrDetected.getAndSet(true)) {
+                    handleAnrDetection(session, DETECTION_WATCHDOG, blockedDurationMs)
                 }
             }
 
             // tick 已被消费，重置 ANR 状态
-            if (tick.get()) {
-                anrDetected.set(false)
-                blockedSinceMs.set(0L)
+            if (session.tick.get()) {
+                session.anrDetected.set(false)
+                session.blockedSinceMs.set(0L)
             }
         }
     }
@@ -293,23 +283,26 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
      *
      * @param source 检测来源（"sigquit" 或 "watchdog"）。
      */
-    private fun handleAnrDetection(source: String, blockedDurationMs: Long = config.anrTimeoutMs) {
+    private fun handleAnrDetection(session: AnrDetectionSession, source: String, blockedDurationMs: Long = config.anrTimeoutMs) {
+        if (!session.isActive()) return
+        val context = apmContext
         val now = ApmClock.monotonicTimeMillis()
         val mainStack = captureMainThreadStack()
 
         // ANR 去重：相同堆栈在窗口内不重复上报
         val fingerprint = computeStackFingerprint(mainStack)
-        if (isDuplicateAnr(now, fingerprint)) {
-            apmContext?.logger?.d("ANR deduplicated, skipping report")
+        if (isDuplicateAnr(session, now, fingerprint)) {
+            context?.logger?.d("ANR deduplicated, skipping report")
             return
         }
 
         // 记录本次 ANR 信息
-        lastReportTimeMs.set(now)
-        lastStackFingerprint = fingerprint
+        session.lastReportTimeMs.set(now)
+        session.lastStackFingerprint = fingerprint
 
         // 收集多次堆栈采样（用于原因分类）
-        val samples = collectStackSamples()
+        val samples = collectStackSamples(session)
+        if (!session.isActive()) return
 
         // ANR 原因分类
         val cause = if (config.enableAnrClassification) {
@@ -324,6 +317,7 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
         } else {
             ""
         }
+        if (!session.isActive()) return
 
         // 判断严重级别
         val severity = if (blockedDurationMs >= config.anrSevereThresholdMs) {
@@ -337,7 +331,7 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
             FIELD_MAIN_THREAD_STACK to mainStack,
             FIELD_ANR_SOURCE to source,
             FIELD_ANR_CAUSE to cause,
-            FIELD_PROCESS_NAME to (apmContext?.processName.orEmpty()),
+            FIELD_PROCESS_NAME to (context?.processName.orEmpty()),
             FIELD_DURATION_MS to blockedDurationMs
         )
 
@@ -355,23 +349,25 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
         // rate limiting, then synchronously hand the complete event to SQLite or critical IPC.
         executeCriticalAnrHandoff(
             criticalHandoff = {
-                Apm.emitCriticalSync(
+                context?.emitInSession(ApmEvent(
                     module = MODULE_NAME,
                     name = EVENT_ANR_DETECTED,
                     kind = ApmEventKind.ALERT,
                     severity = severity,
                     priority = ApmPriority.CRITICAL,
                     fields = fields
-                )
+                ), critical = true, handoffGuard = session::handoff) ?: false
             },
             onFailure = {
-                val error = IllegalStateException("ANR event did not reach the local critical hand-off")
-                apmContext?.logger?.e("ANR local hand-off failed", error)
-                Apm.recordInternalError(ERROR_ANR_HANDOFF, error)
+                if (session.isActive()) {
+                    val error = IllegalStateException("ANR event did not reach the local critical hand-off")
+                    context?.logger?.e("ANR local hand-off failed", error)
+                    Apm.recordInternalError(ERROR_ANR_HANDOFF, error)
+                }
             }
         )
 
-        apmContext?.logger?.w("ANR detected: source=$source, cause=$cause")
+        if (session.isActive()) context?.logger?.w("ANR detected: source=$source, cause=$cause")
     }
 
     // ========================================================================
@@ -384,7 +380,7 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
      *
      * @return 堆栈采样列表。
      */
-    private fun collectStackSamples(): List<String> {
+    private fun collectStackSamples(session: AnrDetectionSession): List<String> {
         if (config.stackSampleCount <= 1) {
             return emptyList()
         }
@@ -393,6 +389,7 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
         // 注意：此处已在 ANR 回调中，主线程可能仍在阻塞
         // 直接采集当前主线程堆栈（不会阻塞）
         for (i in 0 until config.stackSampleCount) {
+            if (!session.isActive()) break
             val stack = captureMainThreadStack()
             // 取堆栈的前 5 行作为指纹
             val shortStack = stack.lines().take(STACK_FINGERPRINT_LINES).joinToString(LINE_SEPARATOR)
@@ -401,6 +398,7 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
                 try {
                     Thread.sleep(config.stackSampleIntervalMs)
                 } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
                     break
                 }
             }
@@ -521,14 +519,14 @@ class AnrModule(private val config: AnrConfig = AnrConfig()) : ApmModule {
      * 判断是否为重复 ANR。
      * 相同堆栈指纹在去重窗口内视为重复。
      */
-    private fun isDuplicateAnr(now: Long, fingerprint: String): Boolean {
-        val lastTime = lastReportTimeMs.get()
+    private fun isDuplicateAnr(session: AnrDetectionSession, now: Long, fingerprint: String): Boolean {
+        val lastTime = session.lastReportTimeMs.get()
         // 超出窗口，不算重复
         if (now - lastTime > config.anrDeduplicationWindowMs) {
             return false
         }
         // 窗口内相同指纹，视为重复
-        return fingerprint == lastStackFingerprint
+        return fingerprint == session.lastStackFingerprint
     }
 
     // ========================================================================
