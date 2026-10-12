@@ -78,7 +78,7 @@ internal object DiagnosticSanitizer {
     )
     /** Sensitive HTTP headers whose entire value must be removed. */
     private val SENSITIVE_HEADER_PATTERN = Regex(
-        "(?i)((?:Authorization|Cookie|Set-Cookie)\\s*:\\s*)(?:Bearer\\s+)?[^\\s,]+"
+        "(?i)((?:Authorization|Cookie|Set-Cookie)[\\t ]*:[\\t ]*)[^\\r\\n]*"
     )
     /** Standalone bearer credentials. */
     private val BEARER_PATTERN = Regex("(?i)Bearer\\s+[A-Za-z0-9._~+/=-]+")

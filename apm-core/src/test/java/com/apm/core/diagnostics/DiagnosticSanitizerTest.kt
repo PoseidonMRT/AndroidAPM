@@ -16,7 +16,7 @@ class DiagnosticSanitizerTest {
     fun `credentials are redacted and messages are bounded`() {
         val input = "https://host/path?token=secret&name=ok Authorization: Bearer abc"
 
-        val output = DiagnosticSanitizer.sanitizeMessage(input.repeat(500))
+        val output = DiagnosticSanitizer.sanitizeMessage((input + "\n").repeat(500))
 
         assertFalse(output.contains("secret"))
         assertFalse(output.contains("Bearer abc"))
@@ -34,6 +34,26 @@ class DiagnosticSanitizerTest {
 
         listOf("json-key", "form-secret", "cookie-value", "set-cookie-value", "encoded-key", "plain-secret")
             .forEach { secret -> assertFalse(output.contains(secret)) }
+    }
+
+    /** Header privacy covers complete values, including spaces, cookie lists, and auth parameters. */
+    @Test
+    fun `complete sensitive headers are redacted without consuming the next line`() {
+        val input = "Authorization: Basic dXNlcjpwYXNz\r\n" +
+            "Cookie: sid=first-value; session=second-value\n" +
+            "Set-Cookie: sid=third-value; Path=/; HttpOnly\n" +
+            "Authorization: Digest username=alice, response=digest-secret\n" +
+            "request completed"
+
+        val output = DiagnosticSanitizer.sanitizeMessage(input)
+
+        listOf("dXNlcjpwYXNz", "first-value", "second-value", "third-value", "alice", "digest-secret")
+            .forEach { secret -> assertFalse(output.contains(secret)) }
+        assertEquals(
+            "Authorization: [REDACTED]\r\nCookie: [REDACTED]\n" +
+                "Set-Cookie: [REDACTED]\nAuthorization: [REDACTED]\nrequest completed",
+            output
+        )
     }
 
     /** Exception stacks must be bounded and deterministically fingerprinted. */

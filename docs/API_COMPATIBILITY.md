@@ -1,6 +1,6 @@
 # AndroidAPM 公共 API 兼容策略
 
-> 同步日期：2026-09-12｜当前 SDK 版本：0.1.0
+> 同步日期：2026-10-13｜当前 SDK 版本：0.1.0
 
 ## 目标与范围
 
@@ -33,6 +33,8 @@
 2026-09-07 修复仅新增可选 `ValidatingApmUploader`/`UploadRejectionReason`、`DiscardablePendingEventStore`、V3 identity validator、HTTP shutdown 状态和 `ConsentRevocationResult.uploadWorkerStopped` getter，以及末尾追加的 drop reason。旧接口不增加必须实现的成员；原 data-class constructor/copy/component 签名保持。撤回结果的退出证据放在类体内，旧 `copy` 产生的结果将该证据重置为 null（未知）。聚合统计由 locale-dependent String 修正为 Double/Int，属于事件内容语义修复，宿主查询需按数值处理。
 
 ## 变更流程
+
+2026-10-13 会话修复仅手工追加 `ApmContext.emitInSession(ApmEvent, Boolean)` 与带最终 handoff guard 的 overload 两项 synthetic JVM 签名，供独立发布的监控模块绑定 runtime。既有构造函数、data-class copy/component、wire、durable codec 和 SQLite schema 保持。宿主需等待 stop/revoke 清理结束再 init；清理进行中明确拒绝重启，这是避免旧清理破坏新状态的生命周期语义修复。
 
 日常验证不修改基线：
 

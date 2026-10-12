@@ -126,6 +126,12 @@ object Apm {
     /** 初始化锁，防止多线程并发 init 导致竞态条件。 */
     private val initLock = Any()
 
+    /** Keeps init excluded until runtime or dormant cleanup finishes; guarded by [initLock]. */
+    private var cleanupInProgress = false
+
+    /** Runtime being retired outside [initLock], available to concurrent consent closure. */
+    private var retiringState: State? = null
+
     /**
      * 初始化 APM 框架。只能在主线程调用一次。
      *
@@ -164,6 +170,7 @@ object Apm {
         occurrenceContext: ApmOccurrenceContext?
     ) {
         synchronized(initLock) {
+            check(!cleanupInProgress) { "APM cleanup is still in progress; retry init after cleanup completes" }
             if (state != null) {
                 return
             }
@@ -353,7 +360,7 @@ object Apm {
             occurrenceContext = occurrenceContext
         )
         context.selfMonitor = selfMonitor
-        val monitoringExecutor = createSelfMonitoringExecutor(config, selfMonitor)
+        val monitoringExecutor = createSelfMonitoringExecutor(config, selfMonitor, context)
         stagedMonitoringExecutor = monitoringExecutor
         val newState = State(
             context = context,
@@ -379,7 +386,7 @@ object Apm {
         val managedDynamicConfig = config.dynamicConfigProvider as? ManagedDynamicConfigProvider
         if (managedDynamicConfig != null) {
             runRecoverableBoundary(
-                block = { managedDynamicConfig.start(::reconcileDynamicModules) },
+                block = { managedDynamicConfig.start { reconcileDynamicModules(newState) } },
                 onFailure = { error -> recordInternalError(ERROR_TAG_DYNAMIC_CONFIG_START, error) }
             )
         }
@@ -433,33 +440,47 @@ object Apm {
         val currentState = synchronized(initLock) {
             val active = state ?: return
             // 先切断新的事件入口，避免 stop 过程中继续接收上报。
+            cleanupInProgress = true
+            retiringState = active
             state = null
             active
         }
-        cleanupSafely(ERROR_TAG_STOP_DYNAMIC_CONFIG) {
-            (currentState.context.config.dynamicConfigProvider as? ManagedDynamicConfigProvider)?.stop()
-        }
-        cleanupSafely(ERROR_TAG_STOP_BIZ_CONTEXT) { currentState.bizContextSource.stop() }
-        cleanupSafely(ERROR_TAG_STOP_MONITOR) { currentState.selfMonitorExecutor?.shutdownNow() }
-        cleanupSafely(ERROR_TAG_STOP_COORDINATOR) { currentState.processCoordinator?.stop() }
-        currentState.startedModules.forEach { module ->
-            cleanupSafely("$ERROR_TAG_STOP_MODULE_PREFIX${module.name}") { module.onStop() }
-        }
-        currentState.startedModules.clear()
-        HostIntegrationRegistry.endSession()
-        cleanupSafely(ERROR_TAG_STOP_DISPATCHER) { currentState.dispatcher.shutdown() }
         try {
-            ApmDiagnostics.record(
-                DiagnosticLevel.INFO,
-                CORE_MODULE,
-                EVENT_DIAGNOSTIC_SESSION_STOP,
-                MESSAGE_STOPPED,
-                null
-            )
-            ApmDiagnostics.flush(DIAGNOSTICS_FLUSH_TIMEOUT_MS)
+            cleanupSafely(ERROR_TAG_STOP_DYNAMIC_CONFIG) {
+                (currentState.context.config.dynamicConfigProvider as? ManagedDynamicConfigProvider)?.stop()
+            }
+            cleanupSafely(ERROR_TAG_STOP_BIZ_CONTEXT) { currentState.bizContextSource.stop() }
+            cleanupSafely(ERROR_TAG_STOP_MONITOR) { currentState.selfMonitorExecutor?.shutdownNow() }
+            cleanupSafely(ERROR_TAG_STOP_COORDINATOR) { currentState.processCoordinator?.stop() }
+            currentState.startedModules.forEach { module ->
+                cleanupSafely("$ERROR_TAG_STOP_MODULE_PREFIX${module.name}") { module.onStop() }
+            }
+            currentState.startedModules.clear()
+            HostIntegrationRegistry.endSession()
+            cleanupSafely(ERROR_TAG_STOP_DISPATCHER) { currentState.dispatcher.shutdown() }
+            try {
+                ApmDiagnostics.record(
+                    DiagnosticLevel.INFO,
+                    CORE_MODULE,
+                    EVENT_DIAGNOSTIC_SESSION_STOP,
+                    MESSAGE_STOPPED,
+                    null
+                )
+                ApmDiagnostics.flush(DIAGNOSTICS_FLUSH_TIMEOUT_MS)
+            } finally {
+                // Diagnostics closes last so cleanup degradation remains inspectable.
+                ApmDiagnostics.shutdown()
+            }
         } finally {
-            // Diagnostics closes last so cleanup degradation remains inspectable.
-            ApmDiagnostics.shutdown()
+            finishLifecycleCleanup()
+        }
+    }
+
+    /** Releases transition ownership only after every old-runtime cleanup phase has returned. */
+    private fun finishLifecycleCleanup() {
+        synchronized(initLock) {
+            retiringState = null
+            cleanupInProgress = false
         }
     }
 
@@ -548,6 +569,36 @@ object Apm {
             bizContext = captureBizContext(currentState)
         )
         return currentState.context.emitCriticalSync(event)
+    }
+
+    /** Binds delayed module work to its captured runtime without holding a lock across host callbacks. */
+    internal fun emitInSession(
+        source: ApmContext,
+        event: ApmEvent,
+        critical: Boolean,
+        handoffGuard: (() -> Boolean) -> Boolean = { handoff -> handoff() }
+    ): Boolean {
+        val currentState = state ?: return false
+        if (!currentState.context.sharesRuntime(source)) return false
+        val bizContext = captureBizContext(currentState)
+        val frozen = snapshotEvent(event)
+        val snapshot = frozen.copy(
+            globalContext = currentState.context.config.defaultContext + bizContext + frozen.globalContext,
+            processName = frozen.processName.ifEmpty { source.processName },
+            priority = if (critical) criticalHandoffPriority(event.priority) else event.priority
+        )
+        val occurrenceBound = frozen.occurrence?.let(snapshot::withOccurrenceContext) ?: snapshot
+        // A stop/re-init or reentrant provider cannot turn this captured context into the new runtime.
+        return handoffGuard {
+            if (state !== currentState) {
+                false
+            } else if (critical) {
+                source.emitCriticalSync(occurrenceBound)
+            } else {
+                source.emit(occurrenceBound)
+                true
+            }
+        }
     }
 
     /**
@@ -645,9 +696,11 @@ object Apm {
      * with register/init/stop. Modules excluded by the emergency `apm.enabled` switch or their
      * individual flag are stopped; newly enabled modules are initialized and started.
      */
-    private fun reconcileDynamicModules() {
+    private fun reconcileDynamicModules(expectedState: State) {
         synchronized(initLock) {
             val currentState = state ?: return
+            // A provider may finish an old callback after stop or even after a new init.
+            if (currentState !== expectedState) return
             for (module in modules) {
                 val started = currentState.startedModules.any { startedModule ->
                     startedModule.name == module.name
@@ -721,73 +774,97 @@ object Apm {
     private fun revokeCollectionConsentInternal(application: Application?): ConsentRevocationResult {
         val currentState = synchronized(initLock) {
             collectionConsentRevoked = true
+            if (cleanupInProgress) {
+                // Close admission immediately, but do not race a second erase/close against its owner.
+                retiringState?.dispatcher?.closeDeliveryForConsentRevocation()
+                return unresolvedConsentCleanup(retiringState != null)
+            }
             val active = state
+            cleanupInProgress = true
+            retiringState = active
+            active?.dispatcher?.closeDeliveryForConsentRevocation()
             state = null
             active
         }
-        val resolvedApplication = application ?: currentState?.context?.application
-        if (currentState == null) {
-            return resolvedApplication?.let(::clearDormantTelemetryForConsentRevocation)
-                ?: ConsentRevocationResult(
-                    wasInitialized = false,
-                    discardedQueuedEventCount = 0,
-                    clearedStoredEventCount = null,
-                    clearedIpcFileCount = 0,
-                    ipcFilesCleared = false,
-                    storageCleared = false
-                )
-        }
-
-        cleanupSafely(ERROR_TAG_STOP_DYNAMIC_CONFIG) {
-            (currentState.context.config.dynamicConfigProvider as? ManagedDynamicConfigProvider)?.stop()
-        }
-        cleanupSafely(ERROR_TAG_STOP_BIZ_CONTEXT) { currentState.bizContextSource.stop() }
-        cleanupSafely(ERROR_TAG_STOP_MONITOR) { currentState.selfMonitorExecutor?.shutdownNow() }
-
-        val ipcCleanup = try {
-            currentState.processCoordinator?.stopAndClearForConsentRevocation()
-                ?: IpcConsentCleanupResult(clearedFileCount = 0, allFilesCleared = true)
-        } catch (error: Exception) {
-            recordInternalError(ERROR_TAG_CONSENT_IPC_CLEAR, error)
-            IpcConsentCleanupResult(clearedFileCount = 0, allFilesCleared = false)
-        }
-        currentState.startedModules.forEach { module ->
-            cleanupSafely("$ERROR_TAG_STOP_MODULE_PREFIX${module.name}") { module.onStop() }
-        }
-        currentState.startedModules.clear()
-
-        val storageCleanup = currentState.dispatcher.shutdownForConsentRevocation()
         try {
-            ApmDiagnostics.record(
-                DiagnosticLevel.INFO,
-                CORE_MODULE,
-                EVENT_DIAGNOSTIC_CONSENT_REVOKED,
-                MESSAGE_CONSENT_REVOKED,
-                null
-            )
-            ApmDiagnostics.flush(DIAGNOSTICS_FLUSH_TIMEOUT_MS)
+            val resolvedApplication = application ?: currentState?.context?.application
+            if (currentState == null) {
+                return resolvedApplication?.let(::clearDormantTelemetryForConsentRevocation)
+                    ?: ConsentRevocationResult(
+                        wasInitialized = false,
+                        discardedQueuedEventCount = 0,
+                        clearedStoredEventCount = null,
+                        clearedIpcFileCount = 0,
+                        ipcFilesCleared = false,
+                        storageCleared = false
+                    )
+            }
+
+            cleanupSafely(ERROR_TAG_STOP_DYNAMIC_CONFIG) {
+                (currentState.context.config.dynamicConfigProvider as? ManagedDynamicConfigProvider)?.stop()
+            }
+            cleanupSafely(ERROR_TAG_STOP_BIZ_CONTEXT) { currentState.bizContextSource.stop() }
+            cleanupSafely(ERROR_TAG_STOP_MONITOR) { currentState.selfMonitorExecutor?.shutdownNow() }
+
+            val ipcCleanup = try {
+                currentState.processCoordinator?.stopAndClearForConsentRevocation()
+                    ?: IpcConsentCleanupResult(clearedFileCount = 0, allFilesCleared = true)
+            } catch (error: Exception) {
+                recordInternalError(ERROR_TAG_CONSENT_IPC_CLEAR, error)
+                IpcConsentCleanupResult(clearedFileCount = 0, allFilesCleared = false)
+            }
+            currentState.startedModules.forEach { module ->
+                cleanupSafely("$ERROR_TAG_STOP_MODULE_PREFIX${module.name}") { module.onStop() }
+            }
+            currentState.startedModules.clear()
+
+            HostIntegrationRegistry.endSession()
+            val storageCleanup = currentState.dispatcher.shutdownForConsentRevocation()
+            try {
+                ApmDiagnostics.record(
+                    DiagnosticLevel.INFO,
+                    CORE_MODULE,
+                    EVENT_DIAGNOSTIC_CONSENT_REVOKED,
+                    MESSAGE_CONSENT_REVOKED,
+                    null
+                )
+                ApmDiagnostics.flush(DIAGNOSTICS_FLUSH_TIMEOUT_MS)
+            } finally {
+                ApmDiagnostics.shutdown()
+            }
+            // Do not reopen shared files if an in-flight handoff prevented proven active cleanup.
+            val dormantCleanup = if (storageCleanup.storageCleared) {
+                resolvedApplication?.let(::clearDormantTelemetryForConsentRevocation)
+            } else null
+            return ConsentRevocationResult(
+                wasInitialized = true,
+                discardedQueuedEventCount = storageCleanup.discardedQueuedEventCount,
+                clearedStoredEventCount = combineNullableCounts(
+                    storageCleanup.clearedStoredEventCount,
+                    dormantCleanup?.clearedStoredEventCount
+                ),
+                clearedIpcFileCount = ipcCleanup.clearedFileCount +
+                    (dormantCleanup?.clearedIpcFileCount ?: 0),
+                ipcFilesCleared = ipcCleanup.allFilesCleared &&
+                    (dormantCleanup?.ipcFilesCleared ?: true),
+                storageCleared = storageCleanup.storageCleared &&
+                    (dormantCleanup?.storageCleared ?: true)
+            ).withUploadWorkerStopped(storageCleanup.uploadWorkerStopped)
         } finally {
-            ApmDiagnostics.shutdown()
+            finishLifecycleCleanup()
         }
-        // Do not reopen shared files if an in-flight handoff prevented proven active cleanup.
-        val dormantCleanup = if (storageCleanup.storageCleared) {
-            resolvedApplication?.let(::clearDormantTelemetryForConsentRevocation)
-        } else null
-        return ConsentRevocationResult(
-            wasInitialized = true,
-            discardedQueuedEventCount = storageCleanup.discardedQueuedEventCount,
-            clearedStoredEventCount = combineNullableCounts(
-                storageCleanup.clearedStoredEventCount,
-                dormantCleanup?.clearedStoredEventCount
-            ),
-            clearedIpcFileCount = ipcCleanup.clearedFileCount +
-                (dormantCleanup?.clearedIpcFileCount ?: 0),
-            ipcFilesCleared = ipcCleanup.allFilesCleared &&
-                (dormantCleanup?.ipcFilesCleared ?: true),
-            storageCleared = storageCleanup.storageCleared &&
-                (dormantCleanup?.storageCleared ?: true)
-        ).withUploadWorkerStopped(storageCleanup.uploadWorkerStopped)
     }
+
+    /** Reports concurrent cleanup as unproven so the host can retry after its owner finishes. */
+    private fun unresolvedConsentCleanup(wasInitialized: Boolean): ConsentRevocationResult =
+        ConsentRevocationResult(
+            wasInitialized = wasInitialized,
+            discardedQueuedEventCount = 0,
+            clearedStoredEventCount = null,
+            clearedIpcFileCount = 0,
+            ipcFilesCleared = false,
+            storageCleared = false
+        )
 
     /** Clears every supported persisted event path when no active runtime owns the stores. */
     private fun clearDormantTelemetryForConsentRevocation(
@@ -938,7 +1015,11 @@ object Apm {
     /**
      * Creates periodic SDK health reporting and automatic throttling.
      */
-    private fun createSelfMonitoringExecutor(config: ApmConfig, monitor: SdkSelfMonitor?): ScheduledExecutorService? {
+    private fun createSelfMonitoringExecutor(
+        config: ApmConfig,
+        monitor: SdkSelfMonitor?,
+        expectedContext: ApmContext
+    ): ScheduledExecutorService? {
         if (monitor == null || config.selfMonitorIntervalMs <= 0L) {
             return null
         }
@@ -960,26 +1041,34 @@ object Apm {
                     publishSdkHealthReport(
                         report = report,
                         diagnosticsSink = { summary ->
-                            ApmDiagnostics.record(
-                                level = DiagnosticLevel.INFO,
-                                component = CORE_MODULE,
-                                code = EVENT_DIAGNOSTIC_SDK_HEALTH,
-                                message = summary,
-                                error = null
-                            )
+                            runInCurrentSession(expectedContext) {
+                                ApmDiagnostics.record(
+                                    level = DiagnosticLevel.INFO,
+                                    component = CORE_MODULE,
+                                    code = EVENT_DIAGNOSTIC_SDK_HEALTH,
+                                    message = summary,
+                                    error = null
+                                )
+                            }
                         },
                         eventSink = { priority, fields ->
-                            emit(
-                                module = CORE_MODULE,
-                                name = EVENT_SDK_HEALTH,
-                                severity = ApmSeverity.INFO,
-                                priority = priority,
-                                fields = fields
+                            expectedContext.emitInSession(
+                                ApmEvent(
+                                    module = CORE_MODULE,
+                                    name = EVENT_SDK_HEALTH,
+                                    severity = ApmSeverity.INFO,
+                                    priority = priority,
+                                    fields = fields,
+                                    timestamp = ApmClock.wallTimeMillis(),
+                                    processName = expectedContext.processName,
+                                    threadName = Thread.currentThread().name
+                                ),
+                                critical = false
                             )
                         }
                     )
                     if (config.enableAutoThrottle) {
-                        applyAutoThrottle(autoThrottleController.evaluate(report))
+                        applyAutoThrottle(autoThrottleController.evaluate(report), expectedContext)
                     }
                 },
                 config.selfMonitorIntervalMs,
@@ -989,14 +1078,22 @@ object Apm {
         }
     }
 
+    /** Prevents global sinks from relabeling a delayed health callback as a new runtime's work. */
+    private inline fun runInCurrentSession(expectedContext: ApmContext, block: () -> Unit) {
+        synchronized(initLock) {
+            if (state?.context === expectedContext) block()
+        }
+    }
+
     /**
      * Applies one automatic-throttle state transition to module lifecycle.
      *
      * @param decision complete throttle state and modules newly eligible for recovery
      */
-    private fun applyAutoThrottle(decision: AutoThrottleDecision) {
+    private fun applyAutoThrottle(decision: AutoThrottleDecision, expectedContext: ApmContext) {
         synchronized(initLock) {
             val currentState = state ?: return
+            if (currentState.context !== expectedContext) return
             // Mirror the controller's complete state so later registration and config callbacks cannot bypass it.
             currentState.autoThrottledModules.clear()
             currentState.autoThrottledModules.addAll(decision.modulesToThrottle)

@@ -822,9 +822,7 @@ internal class ApmDispatcher(
      * @return counts and success state for the process-local privacy erase
      */
     internal fun shutdownForConsentRevocation(): ConsentStorageCleanupResult {
-        consentRevoked = true
-        deliveryClosed = true
-        shutdown = true
+        closeDeliveryForConsentRevocation()
         shutdownPhase("aggregation executor") { aggregationExecutor?.shutdownNow() }
         running = false
 
@@ -879,6 +877,13 @@ internal class ApmDispatcher(
             storageCleared = false,
             uploadWorkerStopped = uploadWorkerStopped
         )
+    }
+
+    /** Closes volatile gates without waiting on host callbacks or racing the cleanup owner. */
+    internal fun closeDeliveryForConsentRevocation() {
+        consentRevoked = true
+        deliveryClosed = true
+        shutdown = true
     }
 
     /** Counts an event that returned from host code after this session's delivery gate closed. */

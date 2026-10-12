@@ -9,6 +9,10 @@ import org.junit.Assert.assertEquals
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.UUID
+import com.apm.core.throttle.ManagedDynamicConfigProvider
 import com.apm.model.ApmEvent
 import com.apm.uploader.ApmUploader
 import org.junit.After
@@ -112,6 +116,224 @@ class ApmConsentLifecycleTest {
         assertFalse(result.storageCleared)
         assertFalse(result.ipcFilesCleared)
         assertTrue(Apm.isCollectionConsentRevoked())
+    }
+
+    /** New init cannot reuse registered module instances while their prior onStop is executing. */
+    @Test
+    fun `stop excludes init until module cleanup completes`() = verifyCleanupExclusion(revoke = false)
+
+    /** A new grant cannot let old privacy erasure delete a newly initialized runtime's data. */
+    @Test
+    fun `revocation excludes init even after a new grant during cleanup`() = verifyCleanupExclusion(revoke = true)
+
+    /** A second cleanup closes old admission but returns unproven rather than erasing concurrently. */
+    @Test
+    fun `revocation during stop is unproven and permits a later dormant retry`() =
+        verifyCleanupExclusion(revoke = false, concurrentRevoke = true)
+
+    /** An old provider callback must never read or reconcile the newly installed provider's state. */
+    @Test
+    fun `delayed dynamic config callback cannot enter the next session`() {
+        val oldProvider = RetainingManagedProvider()
+        Apm.register(BlockingLifecycleModule())
+        Apm.init(application, strictConfig().copy(dynamicConfigProvider = oldProvider))
+        Apm.stop()
+        val newProvider = RetainingManagedProvider()
+        Apm.init(application, strictConfig().copy(dynamicConfigProvider = newProvider))
+        val readsBefore = newProvider.booleanReads.get()
+
+        oldProvider.callback?.invoke()
+
+        assertEquals(readsBefore, newProvider.booleanReads.get())
+        assertTrue(Apm.isInitialized())
+    }
+
+    /** The SDK health timer cannot hold the lifecycle lock while executing a host provider. */
+    @Test
+    fun `blocked health business context cannot block consent revocation`() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        Apm.init(application, strictConfig().copy(
+            enableSelfMonitoring = true,
+            enableAutoThrottle = false,
+            selfMonitorIntervalMs = HEALTH_INTERVAL_MS,
+            bizContextProvider = BizContextProvider {
+                entered.countDown()
+                while (release.count != 0L) {
+                    try {
+                        release.await()
+                    } catch (_: InterruptedException) {
+                        // Simulate host code which outlives executor shutdown.
+                    }
+                }
+                mapOf(TEST_FIELD to BLOCKING_VALUE)
+            }
+        ))
+        val completed = CountDownLatch(1)
+        val result = AtomicReference<ConsentRevocationResult>()
+        val revoker = Thread {
+            try {
+                result.set(Apm.revokeCollectionConsent(application))
+            } finally {
+                completed.countDown()
+            }
+        }.apply { isDaemon = true }
+        try {
+            assertTrue(entered.await(AWAIT_SECONDS, TimeUnit.SECONDS))
+            revoker.start()
+            assertTrue("Revocation must not wait for a host context callback", completed.await(AWAIT_SECONDS, TimeUnit.SECONDS))
+            assertTrue(result.get().storageCleared)
+            Apm.grantCollectionConsent()
+            Apm.init(application, strictConfig())
+        } finally {
+            release.countDown()
+            revoker.join(JOIN_MS)
+        }
+        assertFalse(revoker.isAlive)
+    }
+
+    /** The final module gate executes after the provider and cannot relabel a callback-triggered init. */
+    @Test
+    fun `session bridge checks module and runtime gates after host context capture`() {
+        val module = BlockingLifecycleModule()
+        var active = true
+        Apm.register(module)
+        Apm.init(application, strictConfig().copy(
+            bizContextProvider = BizContextProvider {
+                active = false
+                mapOf(TEST_FIELD to BLOCKING_VALUE)
+            }
+        ))
+        val accepted = module.context.emitInSession(ApmEvent(module = TEST_MODULE, name = TEST_EVENT), true) { handoff ->
+            if (active) handoff() else false
+        }
+        assertFalse(accepted)
+        val inspector = SQLiteEventStore(EventDbHelper(application))
+        try {
+            assertEquals(0, inspector.pendingCount())
+        } finally {
+            inspector.close()
+        }
+    }
+
+    /** Session delivery retains contextual metadata and supplies the actual current process name. */
+    @Test
+    fun `session bridge preserves default business and explicit context`() {
+        val module = BlockingLifecycleModule()
+        Apm.register(module)
+        Apm.init(application, strictConfig().copy(
+            defaultContext = mapOf("default" to "bundled"),
+            bizContextProvider = BizContextProvider { mapOf("business" to "captured") }
+        ))
+        assertTrue(module.context.emitInSession(
+            ApmEvent(module = TEST_MODULE, name = TEST_EVENT, globalContext = mapOf("explicit" to "module")),
+            critical = true
+        ))
+        val inspector = SQLiteEventStore(EventDbHelper(application))
+        try {
+            val stored = inspector.readPending(1).single().event
+            assertEquals(module.context.processName, stored.processName)
+            assertFalse(stored.processName.isEmpty())
+            assertEquals(mapOf("default" to "bundled", "business" to "captured", "explicit" to "module"), stored.globalContext)
+        } finally {
+            inspector.close()
+        }
+    }
+
+    /** Holds a real lifecycle callback open so overlap assertions do not depend on thread timing. */
+    private fun verifyCleanupExclusion(revoke: Boolean, concurrentRevoke: Boolean = false) {
+        val module = BlockingLifecycleModule()
+        Apm.register(module)
+        Apm.init(application, strictConfig())
+        module.blockStop.set(true)
+        val result = AtomicReference<ConsentRevocationResult>()
+        val failure = AtomicReference<Throwable>()
+        val cleanup = Thread {
+            try {
+                if (revoke) result.set(Apm.revokeCollectionConsent(application)) else Apm.stop()
+            } catch (error: Throwable) {
+                // Surface test-thread failures on the assertion thread after releasing the latch.
+                failure.set(error)
+            }
+        }.apply { isDaemon = true; start() }
+        try {
+            assertTrue(module.stopEntered.await(AWAIT_SECONDS, TimeUnit.SECONDS))
+            assertFalse(Apm.isInitialized())
+            if (concurrentRevoke) {
+                val concurrentResult = Apm.revokeCollectionConsent(application)
+                assertFalse(concurrentResult.storageCleared)
+                assertFalse(concurrentResult.ipcFilesCleared)
+            }
+            if (revoke || concurrentRevoke) {
+                assertFalse(module.context.emitCriticalSync(ApmEvent(module = TEST_MODULE, name = TEST_EVENT)))
+                Apm.grantCollectionConsent()
+            }
+            assertThrows(IllegalStateException::class.java) { Apm.init(application, strictConfig()) }
+            assertEquals(1, module.startCount.get())
+        } finally {
+            module.stopRelease.countDown()
+            cleanup.join(JOIN_MS)
+        }
+        assertFalse(cleanup.isAlive)
+        assertEquals(null, failure.get())
+        if (revoke) assertTrue(result.get().storageCleared)
+        if (concurrentRevoke) {
+            assertTrue(Apm.revokeCollectionConsent(application).storageCleared)
+            Apm.grantCollectionConsent()
+        }
+        Apm.init(application, strictConfig())
+        assertTrue(Apm.isInitialized())
+        assertEquals(2, module.startCount.get())
+    }
+
+    /** Module with one optional blocked stop; later test teardown never waits on the same latch. */
+    private class BlockingLifecycleModule : ApmModule {
+        /** A unique name avoids collisions with modules retained across singleton integration tests. */
+        override val name = "lifecycle-" + UUID.randomUUID().toString()
+        /** Current context retained to verify old dispatcher admission closure. */
+        lateinit var context: ApmContext
+        /** Counts completed starts. */
+        val startCount = AtomicInteger()
+        /** Enables exactly one blocked stop. */
+        val blockStop = AtomicBoolean(false)
+        /** Announces entry to the controlled host callback. */
+        val stopEntered = CountDownLatch(1)
+        /** Releases the host callback after overlap assertions. */
+        val stopRelease = CountDownLatch(1)
+        /** Retains the current context just like a real module. */
+        override fun onInitialize(context: ApmContext) { this.context = context }
+        /** Records each session's start. */
+        override fun onStart() { startCount.incrementAndGet() }
+        /** Blocks only when the test armed this stop. */
+        override fun onStop() {
+            if (blockStop.compareAndSet(true, false)) {
+                stopEntered.countDown()
+                check(stopRelease.await(AWAIT_SECONDS, TimeUnit.SECONDS))
+            }
+        }
+    }
+
+    /** Provider retaining an already captured callback to simulate delayed background completion. */
+    private class RetainingManagedProvider : ManagedDynamicConfigProvider {
+        /** Callback which remains callable after provider stop. */
+        var callback: (() -> Unit)? = null
+        /** Counts reconciliation reads without changing any policy. */
+        val booleanReads = AtomicInteger()
+        /** Records boolean policy reads. */
+        override fun getBoolean(key: String, defaultValue: Boolean): Boolean {
+            booleanReads.incrementAndGet()
+            return defaultValue
+        }
+        /** Leaves numeric policy unchanged. */
+        override fun getLongValue(key: String, defaultValue: Long): Long = defaultValue
+        /** Leaves floating policy unchanged. */
+        override fun getFloatValue(key: String, defaultValue: Float): Float = defaultValue
+        /** Leaves text policy unchanged. */
+        override fun getString(key: String, defaultValue: String): String = defaultValue
+        /** Captures the callback a background operation would retain. */
+        override fun start(onConfigChanged: () -> Unit) { callback = onConfigChanged }
+        /** Simulates a callback already in flight when polling stops. */
+        override fun stop() = Unit
     }
 
     /** Reentrant revocation cannot claim erase while the outer custom append still owns delivery. */
@@ -262,5 +484,7 @@ class ApmConsentLifecycleTest {
         private const val TEST_THREAD = "consent-critical-test"
         /** Long delay prevents a retry loop from racing the immediate revocation assertion. */
         private const val RETRY_DELAY_MS = 60_000L
+        /** Short health cadence used to reach a real SDK timer callback deterministically. */
+        private const val HEALTH_INTERVAL_MS = 10L
     }
 }

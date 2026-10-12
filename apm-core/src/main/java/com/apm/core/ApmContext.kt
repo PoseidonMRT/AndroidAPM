@@ -52,6 +52,25 @@ class ApmContext internal constructor(
         }
     }
 
+    /**
+     * Cross-artifact delivery preserving default/business context and this runtime's identity.
+     * Returns false when this context's runtime has stopped; ordinary true means dispatch attempted.
+     * Host context callbacks run without a lifecycle lock, and cannot redirect this event to a new init.
+     */
+    @JvmSynthetic
+    fun emitInSession(event: ApmEvent, critical: Boolean): Boolean = Apm.emitInSession(this, event, critical)
+
+    /** Runs a module's final session guard after all host business-context callbacks have returned. */
+    @JvmSynthetic
+    fun emitInSession(
+        event: ApmEvent,
+        critical: Boolean,
+        handoffGuard: (() -> Boolean) -> Boolean
+    ): Boolean = Apm.emitInSession(this, event, critical, handoffGuard)
+
+    /** Recognizes logger-scoped module contexts which share the same runtime dispatcher. */
+    internal fun sharesRuntime(other: ApmContext): Boolean = dispatcher === other.dispatcher
+
     /** Cross-artifact snapshot for future process-exit attribution; native frames are event-specific. */
     @JvmSynthetic
     fun captureExitOccurrence(): ApmOccurrenceContext? =

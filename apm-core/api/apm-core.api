@@ -144,6 +144,8 @@ public final class com/apm/core/ApmContext {
 	public final fun emit (Lcom/apm/model/ApmEvent;)V
 	public final fun emitCriticalSync (Lcom/apm/model/ApmEvent;)Z
 	public final synthetic fun emitHistorical (Lcom/apm/model/ApmEvent;)Z
+	public final synthetic fun emitInSession (Lcom/apm/model/ApmEvent;Z)Z
+	public final synthetic fun emitInSession (Lcom/apm/model/ApmEvent;ZLkotlin/jvm/functions/Function1;)Z
 	public final fun getApplication ()Landroid/app/Application;
 	public final fun getConfig ()Lcom/apm/core/ApmConfig;
 	public final fun getLogger ()Lcom/apm/core/ApmLogger;

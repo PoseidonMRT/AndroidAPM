@@ -286,6 +286,10 @@ core/监控模块应使用该设施。`apm-uploader` 是下层模块，不能反
 
 Consent revocation 使用独立顺序：先在 `initLock` 下设置 sticky gate 并清空 `state`，再停止配置/业务上下文/自监控/IPC producer 与模块；dispatcher queue 直接丢弃并计入 drop，不 drain，也不 flush aggregation；persistent worker/uploader 结束后才 clear/close store。带 `Application` 的 overload 会在 runtime 已停止或冷启动时重新打开并清理 SQLite/File 路径，同时删除 IPC `.ipc/.tmp`。结果对象区分实际清理、未知计数和无法定位；重新同意需要 `grantCollectionConsent()` + `init()`。该 gate 是进程本地状态，多进程宿主负责把撤回通知送达每个 SDK 进程。
 
+2026-10-13 补齐清理所有权：stop、撤回及 dormant 清理期间保持 `cleanupInProgress`，新 init 明确抛出 `IllegalStateException`，调用方须在清理结束后重试；即使先 grant，也不能复用尚在清理的模块/存储。并发撤回立即永久关闭 retiring dispatcher 的交接门禁，返回 `storageCleared=false`/`ipcFilesCleared=false` 的未证明结果，不启动另一清理 helper。配置回调、自监控和 SDK 内跨模块报告绑定捕获 runtime，迟到结果不能转入新 state。
+
+`ApmContext.emitInSession` 两个 synthetic overload 提供独立制品间的交接桥：在宿主业务上下文回调之外捕获 runtime，在 callback 和 payload 冻结后重查原 runtime 及可选模块门禁；critical 保留同步 durable/IPC 语义。默认/业务上下文与发生身份保留。诊断日志中的 Authorization/Cookie/Set-Cookie 脱敏消耗完整物理行，覆盖多段凭据且保持下一行。
+
 ## 14. 测试重点
 
 - `ApmConfigTest`, `ApmConsentLifecycleTest`, `UploaderFactoryTest`
